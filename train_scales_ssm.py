@@ -25,7 +25,7 @@ MODEL = 'ACCESS-ESM1-5'
 INDICATOR = 'tas'
 TEST_SCENARIOS = ['flat10cdrincspinoff']
 TRAIN_SCENARIOS = [ 'ssp534-over','ssp585','1pctco2','ssp245','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff','abrupt4xco2','ssp119','ssp460','ssp370']
-N = 200
+N = 150
 ML_MODEL = 'feed_forward'
 PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
@@ -1346,7 +1346,7 @@ def run_train(
            
             # anneal KL weight
             global_step += 1
-            frac = min(1.0, global_step / max(1, int(0.3 * total_steps)))
+            frac = min(1.0, global_step / int(0.03 * total_steps))
             kl_w = frac  # 0->1
          
             loss = nll + kl_w * kl
@@ -1390,6 +1390,8 @@ def run_train(
         va = float(np.mean(va_loss))
         mse = float(np.mean(va_mse))
         print(f"epoch {epoch:03d} | train {tr:.4f} | val_elbo {va:.4f} | val_mse {mse:.4f}")
+        os.makedirs("outputs_ssm_scales", exist_ok=True)
+        torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
 
         # early stopping on val_elbo
         if va < best_val - 1e-4:
@@ -1435,13 +1437,13 @@ def make_synth(N=500, T=80, Dy=1, Du=2, seed=0):
 
 if __name__ == "__main__":
     u = train_data_shuffeled[0][0,:].T[..., None]
-    y = np.transpose(train_data_shuffeled[0][1:3,:],(2, 1, 0))
+    y = np.transpose(train_data_shuffeled[0][44:48,:],(2, 1, 0))
     print(u.shape)
     print(y.shape)
 
     device = "cuda"
 
-    model, y_scaler, u_scaler = run_train(y, u, context_len=50, horizon=130, device=device,epochs=10)
+    model, y_scaler, u_scaler = run_train(y, u, context_len=50, horizon=80, device=device,epochs=10)
     os.makedirs("outputs_ssm_scales", exist_ok=True)
     torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
     y_scaler.save("outputs_ssm_scales/y_scaler.out")
