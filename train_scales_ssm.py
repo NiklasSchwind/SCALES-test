@@ -24,8 +24,8 @@ from sklearn.linear_model import LinearRegression
 MODEL = 'ACCESS-ESM1-5'
 INDICATOR = 'tas'
 TEST_SCENARIOS = ['flat10cdrincspinoff']
-TRAIN_SCENARIOS = [ 'ssp534-over','ssp585','1pctco2','ssp245','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
-N = 150
+TRAIN_SCENARIOS = [ 'ssp534-over','flat10cdrincspinoff']#'ssp585','1pctco2','ssp245','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
+N = 200
 ML_MODEL = 'feed_forward'
 PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
@@ -1391,7 +1391,7 @@ def run_train(
          
             loss = nll + kl_w * kl + alpha*roll_out_mse
 
-            if(global_step%1000==0):
+            if(global_step%100==0):
                 print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item())
             
             opt.zero_grad()
@@ -1486,7 +1486,7 @@ if __name__ == "__main__":
 
     device = "cuda"
 
-    model, y_scaler, u_scaler = run_train(y, u, context_len=50, horizon=80, device=device,epochs=10)
+    model, y_scaler, u_scaler = run_train(y, u, context_len=50, horizon=25, device=device,epochs=10)
     os.makedirs("outputs_ssm_scales", exist_ok=True)
     torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
     y_scaler.save("outputs_ssm_scales/y_scaler.out")
