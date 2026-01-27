@@ -1277,6 +1277,42 @@ class DeepSSMConditioned(nn.Module):
         samp = torch.stack(ysamps, dim=0)  # [S,B,steps,Dy]
         return samp.mean(0), samp.quantile(0.10, 0), samp.quantile(0.90, 0)
 
+    @torch.no_grad()
+    def forecast_deterministic(self, y_ctx, u_ctx, u_fut, steps, n_samples=50):
+        B, Tc, _ = y_ctx.shape
+
+        rnn_in = torch.cat([y_ctx, u_ctx], dim=-1)
+        h, _ = self.gru(rnn_in)
+        q_params = self.q_head(h[:, -1:])
+        mu_qT, logvar_qT = torch.chunk(q_params.squeeze(1), 2, dim=-1)
+        logvar_qT = torch.clamp(logvar_qT, -12.0, 6.0)
+
+        sigma_y = torch.exp(torch.clamp(self.log_sigma_y, -6.0, 3.0))
+
+        ysamps = []
+        for _ in range(n_samples):
+            z = self.sample(mu_qT, logvar_qT)
+
+            preds = []
+            for k in range(steps):
+                u_t = u_fut[:, k]
+                mu_p, logvar_p = torch.chunk(self.trans(torch.cat([z, u_t], dim=-1)), 2, dim=-1)
+                logvar_p = torch.clamp(logvar_p, -12.0, 6.0)
+                z = self.sample(mu_p, logvar_p)
+
+                if self.emission_uses_u:
+                    y_hat = self.emit(torch.cat([z, u_t], dim=-1))
+                else:
+                    y_hat = self.emit(z)
+
+                y_s = y_hat #+ sigma_y * torch.randn_like(y_hat)
+                preds.append(y_s)
+
+            ysamps.append(torch.stack(preds, dim=1))  # [B,steps,Dy]
+
+        samp = torch.stack(ysamps, dim=0)  # [S,B,steps,Dy]
+        return samp.mean(0), samp.quantile(0.10, 0), samp.quantile(0.90, 0)
+
 
 # -------------------------
 # Train / eval loop with early stopping
@@ -1343,13 +1379,20 @@ def run_train(
             u_full = torch.cat([u_ctx, u_fut], dim=1)
        
             nll, kl = model.forward_elbo(y_full, u_full, kl_free_bits=0.2)
+            mean, _, _ = model.forecast_deterministic(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
+            roll_out_mse =((mean - y_fut) ** 2).mean()
            
             # anneal KL weight
             global_step += 1
-            frac = min(1.0, global_step / int(0.03 * total_steps))
+            frac = min(1.0, global_step / int(0.3 * total_steps))
             kl_w = frac  # 0->1
+            kl_w = 2
+            alpha = 5
          
-            loss = nll + kl_w * kl
+            loss = nll + kl_w * kl + alpha*roll_out_mse
+
+            if(global_step%1000==0):
+                print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item())
             
             opt.zero_grad()
             loss.backward()
