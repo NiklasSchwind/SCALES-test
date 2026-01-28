@@ -24,7 +24,7 @@ from sklearn.linear_model import LinearRegression
 MODEL = 'ACCESS-ESM1-5'
 INDICATOR = 'tas'
 TEST_SCENARIOS = ['flat10cdrincspinoff']
-TRAIN_SCENARIOS = [ 'ssp534-over','flat10cdrincspinoff']#'ssp585','1pctco2','ssp245','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
+TRAIN_SCENARIOS = [ 'ssp534-over','flat10cdrincspinoff','ssp585']#,'1pctco2','ssp245','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
 N = 200
 ML_MODEL = 'feed_forward'
 PATTERN_SCALING_RESIDUALS = False
