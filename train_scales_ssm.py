@@ -1486,7 +1486,7 @@ if __name__ == "__main__":
 
     device = "cuda"
 
-    model, y_scaler, u_scaler = run_train(y, u, context_len=50, horizon=25, device=device,epochs=10)
+    model, y_scaler, u_scaler = run_train(y, u, context_len=50, z_dim=24,horizon=50, device=device,epochs=10)
     os.makedirs("outputs_ssm_scales", exist_ok=True)
     torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
     y_scaler.save("outputs_ssm_scales/y_scaler.out")
