@@ -1386,7 +1386,7 @@ def run_train(
             global_step += 1
             frac = min(1.0, global_step / int(0.3 * total_steps))
             kl_w = frac  # 0->1
-            kl_w = 2
+            kl_w = 5
             alpha = 1000
          
             loss = nll + kl_w * kl + alpha*roll_out_mse
