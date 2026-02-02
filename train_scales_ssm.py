@@ -1480,7 +1480,8 @@ def make_synth(N=500, T=80, Dy=1, Du=2, seed=0):
 
 if __name__ == "__main__":
     u = train_data_shuffeled[0][0,:].T[..., None]
-    y = np.transpose(train_data_shuffeled[0][44:48,:],(2, 1, 0))
+    #y = np.transpose(train_data_shuffeled[0][44:48,:],(2, 1, 0))
+    y = np.transpose(train_data_shuffeled[0],(2, 1, 0))
     print(u.shape)
     print(y.shape)
 
