@@ -12,6 +12,8 @@ N = 200
 ML_MODEL = 'feed_forward' 
 PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
+monthly_flag = False
+use_smoothing = True
 
 MODEL_PATH = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 
