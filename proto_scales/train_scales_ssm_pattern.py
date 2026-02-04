@@ -14,6 +14,7 @@ PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
 monthly_flag = False
 use_smoothing = True
+train_pattern_scaling_name = 'flat10cdrincspinoff'
 
 MODEL_PATH = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 
