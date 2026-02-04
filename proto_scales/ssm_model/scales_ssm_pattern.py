@@ -196,15 +196,15 @@ def run_train(
     y_va, u_va = y_np[va_idx], u_np[va_idx]
 
     # normalize (fit on train only)
-    y_scaler = StandardScaler().fit(y_tr)
-    u_scaler = StandardScaler().fit(u_tr)
+    y_scaler = scales_ssm.StandardScaler().fit(y_tr)
+    u_scaler = scales_ssm.StandardScaler().fit(u_tr)
     y_trn = y_scaler.transform(y_tr)
     y_van = y_scaler.transform(y_va)
     u_trn = u_scaler.transform(u_tr)
     u_van = u_scaler.transform(u_va)
    
-    train_ds = UnifiedWindowDataset(y_trn, u_trn, context_len=context_len, horizon=horizon)
-    val_ds   = UnifiedWindowDataset(y_van, u_van, context_len=context_len, horizon=horizon)
+    train_ds = scales_ssm.UnifiedWindowDataset(y_trn, u_trn, context_len=context_len, horizon=horizon)
+    val_ds   = scales_ssm.UnifiedWindowDataset(y_van, u_van, context_len=context_len, horizon=horizon)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_dl   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
