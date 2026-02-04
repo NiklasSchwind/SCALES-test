@@ -160,10 +160,13 @@ class DeepSSMPatternConditioned(nn.Module):
                 logvar_p = torch.clamp(logvar_p, -12.0, 6.0)
                 z = self.sample(mu_p, logvar_p)
 
+                ctrl = self.ctrl_lin(u_t)
                 if self.emission_uses_u:
-                    y_hat = self.emit(torch.cat([z, u_t], dim=-1))
+                    res = self.emit(torch.cat([z, u_t], dim=-1))
                 else:
-                    y_hat = self.emit(z)
+                    res = self.emit(z)
+
+                y_hat = ctrl + res
 
                 y_s = y_hat #+ sigma_y * torch.randn_like(y_hat)
                 preds.append(y_s)
