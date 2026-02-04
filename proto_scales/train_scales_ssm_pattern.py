@@ -3,6 +3,7 @@ import os
 import proto_scales.data_prep.prepare_data as prep
 import torch
 import proto_scales.ssm_model.scales_ssm_pattern as scales_ssm_pattern
+import numpy as np
 
 MODEL = 'ACCESS-ESM1-5'
 INDICATOR = 'tas'
