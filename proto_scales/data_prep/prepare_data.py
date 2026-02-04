@@ -780,7 +780,7 @@ def process_gmt_and_regions_into_array(
             if weighted_linear_smoothing:
                 gmt_vals = smooth_regional_indicator_timeseries(regional_indicator=gmt_vals, bandwidth=20, is_monthly=is_monthly)
             #slopes, intercepts = fit_regional_regressions(gmt_vals, regional_vals.transpose(1,0))
-            regional_regression_slopes_intersepts = fit_regional_regressions(gmt_vals, regional_vals.transpose(1,0), RAMP_DOWN_CORRECTED_PS)    
+            regional_regression_slopes_intersepts = fit_regional_regressions(gmt_vals, regional_vals.transpose(1,0), ramp_down_corrected_ps)    
             return regional_regression_slopes_intersepts
         else: 
             slopes_up, intercepts_up, slopes_down, intercepts_down  = slope_intercept["slopes_up"], slope_intercept["intercepts_up"], slope_intercept["slopes_down"], slope_intercept["intercepts_down"]
