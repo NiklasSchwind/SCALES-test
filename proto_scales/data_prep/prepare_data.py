@@ -709,7 +709,13 @@ def fit_regional_regressions(
         "intercepts_down": intercepts_down,
     }
 
-def process_gmt_and_regions_into_array(data_tuple: Tuple[pd.DataFrame, pd.DataFrame], weighted_linear_smoothing = False, pattern_scaling_residuals = False, slope_intercept = None) -> np.ndarray:
+def process_gmt_and_regions_into_array(
+    data_tuple: Tuple[pd.DataFrame, pd.DataFrame],
+    ramp_down_corrected_ps, 
+    weighted_linear_smoothing = False, 
+    pattern_scaling_residuals = False, 
+    slope_intercept = None,
+    ) -> np.ndarray:
     """
     Processes a single tuple of (GMT DataFrame, regional DataFrame) into
     a numpy array of shape (1 + number_regions) x number_timesteps.
