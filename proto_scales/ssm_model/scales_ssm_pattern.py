@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import proto_scales.ssm_model.scales_ssm as scales_ssm
-
+import os
 
 
 class DeepSSMPatternConditioned(nn.Module):
