@@ -177,6 +177,35 @@ class DeepSSMPatternConditioned(nn.Module):
         return samp.mean(0), samp.quantile(0.10, 0), samp.quantile(0.90, 0)
 
 
+def fit_control_mahalanobis(u_train_norm, eps=1e-6):
+    """
+    u_train_norm: [N, T, Du] standardized using train-only scaler
+    Returns mu [Du], inv_cov [Du, Du]
+    """
+    U = u_train_norm.reshape(-1, u_train_norm.shape[-1])  # [N*T, Du]
+    mu = U.mean(axis=0)
+    cov = np.cov(U.T) + eps * np.eye(U.shape[1])
+    inv_cov = np.linalg.inv(cov)
+    return mu.astype(np.float32), inv_cov.astype(np.float32)
+
+def mahalanobis_score(u_fut_norm, mu, inv_cov):
+    """
+    u_fut_norm: [B, H, Du] standardized
+    returns score: [B, H] (per-step)
+    """
+    diff = u_fut_norm - mu[None, None, :]
+    # score[b,h] = diff^T inv_cov diff
+    return np.einsum("bhd,dd,bhd->bh", diff, inv_cov, diff)
+
+def pick_threshold_from_val(val_loader, mu, inv_cov, percentile=99.0):
+    all_scores = []
+    for _, _, u_fut, _ in val_loader:
+        s = mahalanobis_score(u_fut.numpy(), mu, inv_cov)  # [B,H]
+        all_scores.append(s.reshape(-1))
+    all_scores = np.concatenate(all_scores)
+    return float(np.percentile(all_scores, percentile))
+
+
 # -------------------------
 # Train / eval loop with early stopping
 # -------------------------
@@ -205,11 +234,15 @@ def run_train(
     y_van = y_scaler.transform(y_va)
     u_trn = u_scaler.transform(u_tr)
     u_van = u_scaler.transform(u_va)
+
+    #mu_control, inv_cov_control = fit_control_mahalanobis(u_trn)
    
     train_ds = scales_ssm.UnifiedWindowDataset(y_trn, u_trn, context_len=context_len, horizon=horizon)
     val_ds   = scales_ssm.UnifiedWindowDataset(y_van, u_van, context_len=context_len, horizon=horizon)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_dl   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    #tau_ood = pick_threshold_from_val(val_dl,mu_control,inv_cov_control)
 
     Dy = y_np.shape[-1]
     Du = u_np.shape[-1]
@@ -313,4 +346,170 @@ def run_train(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    return model, y_scaler, u_scaler
+    return model, y_scaler, u_scaler#,mu_control,inv_cov_control,tau_ood
+
+
+# -------------------------
+# Train / eval loop with early stopping
+# -------------------------
+def run_train_linear_first(
+    y_np, u_np,
+    context_len=40, horizon=12,
+    batch_size=64,
+    epochs=50,
+    lr=2e-3,
+    z_dim=16,
+    device="cpu",
+):
+    # split
+    N = y_np.shape[0]
+    idx = np.random.permutation(N)
+    n_train = int(0.8 * N)
+    tr_idx, va_idx = idx[:n_train], idx[n_train:]
+
+    y_tr, u_tr = y_np[tr_idx], u_np[tr_idx]
+    y_va, u_va = y_np[va_idx], u_np[va_idx]
+
+    # normalize (fit on train only)
+    y_scaler = scales_ssm.StandardScaler().fit(y_tr)
+    u_scaler = scales_ssm.StandardScaler().fit(u_tr)
+    y_trn = y_scaler.transform(y_tr)
+    y_van = y_scaler.transform(y_va)
+    u_trn = u_scaler.transform(u_tr)
+    u_van = u_scaler.transform(u_va)
+
+    #mu_control, inv_cov_control = fit_control_mahalanobis(u_trn)
+   
+    train_ds = scales_ssm.UnifiedWindowDataset(y_trn, u_trn, context_len=context_len, horizon=horizon)
+    val_ds   = scales_ssm.UnifiedWindowDataset(y_van, u_van, context_len=context_len, horizon=horizon)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    val_dl   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    #tau_ood = pick_threshold_from_val(val_dl,mu_control,inv_cov_control)
+
+    Dy = y_np.shape[-1]
+    Du = u_np.shape[-1]
+    model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    best_val = float("inf")
+    best_state = None
+    patience, patience_left = 15, 15
+  
+    # KL annealing schedule: ramp from 0 -> 1 over first ~30% of training
+    total_steps = epochs * len(train_dl)
+    global_step = 0
+
+    for epoch in range(1, epochs + 1):
+       
+        model.train()
+        
+        tr_loss = []
+        if(epoch>1):
+            for p in model.ctrl_lin.parameters():
+                p.requires_grad = False
+            for name, p in model.named_parameters():
+                if "ctrl_lin" not in name:
+                    p.requires_grad = True
+            opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-3)
+        
+        else:
+            # freeze everything
+            for p in model.parameters():
+                p.requires_grad = False
+            # unfreeze D
+            for p in model.ctrl_lin.parameters():
+                p.requires_grad = True
+            opt = torch.optim.AdamW(model.ctrl_lin.parameters(), lr=1e-2)
+
+
+        for y_ctx, u_ctx, u_fut, y_fut in train_dl:
+           
+            y_ctx = torch.tensor(y_ctx, device=device)
+            u_ctx = torch.tensor(u_ctx, device=device)
+            u_fut = torch.tensor(u_fut, device=device)
+            y_fut = torch.tensor(y_fut, device=device)
+          
+            # We train on full (context+horizon) to teach dynamics across the boundary:
+            y_full = torch.cat([y_ctx, y_fut], dim=1)
+            u_full = torch.cat([u_ctx, u_fut], dim=1)
+       
+            nll, kl = model.forward_elbo(y_full, u_full, kl_free_bits=0.2)
+            mean, _, _ = model.forecast_deterministic(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
+            roll_out_mse =((mean - y_fut) ** 2).mean()
+            lin_mean = model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
+            lin_mse = ((lin_mean-y_full)**2).mean()
+            
+           
+            # anneal KL weight
+            global_step += 1
+            frac = min(1.0, global_step / int(0.3 * total_steps))
+            kl_w = frac  # 0->1
+            kl_w = 5
+            alpha = 10000
+         
+            if(epoch>1):
+                loss = nll + kl_w * kl + alpha*roll_out_mse
+            else:
+                loss = lin_mse
+
+            if(global_step%100==0):
+                print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item())
+            
+            opt.zero_grad()
+            loss.backward()
+            
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+           
+            opt.step()
+           
+
+            tr_loss.append(loss.item())
+
+        # validation: one-step objective + forecast MSE on horizon
+        model.eval()
+        
+        va_loss = []
+        va_mse = []
+
+        with torch.no_grad():
+            for y_ctx, u_ctx, u_fut, y_fut in val_dl:
+                
+                y_ctx = torch.tensor(y_ctx, device=device)
+                u_ctx = torch.tensor(u_ctx, device=device)
+                u_fut = torch.tensor(u_fut, device=device)
+                y_fut = torch.tensor(y_fut, device=device)
+
+                y_full = torch.cat([y_ctx, y_fut], dim=1)
+                u_full = torch.cat([u_ctx, u_fut], dim=1)
+
+                nll, kl = model.forward_elbo(y_full, u_full, kl_free_bits=0.2)
+                loss = nll + 1.0 * kl
+                va_loss.append(loss.item())
+
+                mean, _, _ = model.forecast(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
+                mse = ((mean - y_fut) ** 2).mean().item()
+                va_mse.append(mse)
+
+        tr = float(np.mean(tr_loss))
+        va = float(np.mean(va_loss))
+        mse = float(np.mean(va_mse))
+        print(f"epoch {epoch:03d} | train {tr:.4f} | val_elbo {va:.4f} | val_mse {mse:.4f}")
+        os.makedirs("outputs_ssm_scales", exist_ok=True)
+        torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
+
+        # early stopping on val_elbo
+        if va < best_val - 1e-4:
+            best_val = va
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_left = patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                print("Early stopping.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, y_scaler, u_scaler#,mu_control,inv_cov_control,tau_ood
