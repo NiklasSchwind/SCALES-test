@@ -424,7 +424,7 @@ def run_train_linear_first(
 
 
         for y_ctx, u_ctx, u_fut, y_fut in train_dl:
-            B, Tc, _ = y_ctx.shape
+            
            
             y_ctx = torch.tensor(y_ctx, device=device)
             u_ctx = torch.tensor(u_ctx, device=device)
@@ -434,11 +434,12 @@ def run_train_linear_first(
             # We train on full (context+horizon) to teach dynamics across the boundary:
             y_full = torch.cat([y_ctx, y_fut], dim=1)
             u_full = torch.cat([u_ctx, u_fut], dim=1)
+            B, T, _ = y_full.shape
        
             nll, kl = model.forward_elbo(y_full, u_full, kl_free_bits=0.2)
             mean, _, _ = model.forecast_deterministic(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
             roll_out_mse =((mean - y_fut) ** 2).mean()
-            lin_mean = model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, Tc, Dy)
+            lin_mean = model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
             lin_mse = ((lin_mean-y_full)**2).mean()
             
            
