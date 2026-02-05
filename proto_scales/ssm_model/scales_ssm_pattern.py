@@ -405,7 +405,7 @@ def run_train_linear_first(
         model.train()
         
         tr_loss = []
-        if(epoch>1):
+        if(epoch>3):
             for p in model.ctrl_lin.parameters():
                 p.requires_grad = False
             for name, p in model.named_parameters():
@@ -450,7 +450,7 @@ def run_train_linear_first(
             kl_w = 5
             alpha = 10000
          
-            if(epoch>1):
+            if(epoch>3):
                 loss = nll + kl_w * kl + alpha*roll_out_mse
             else:
                 loss = lin_mse
