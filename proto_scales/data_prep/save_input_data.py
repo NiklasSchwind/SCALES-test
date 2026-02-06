@@ -940,7 +940,7 @@ else:
 
 train_data_input, train_data_output = prepare_all_train_data(train_data_np, n=N)
 test_data_input, test_data_output = prepare_all_train_data(test_data_np, n=N)
-test_data_for_autoregression_input, test_data_for_autoregression_output = prep.prepare_train_data(test_data_np[0],N)
+test_data_for_autoregression_input, test_data_for_autoregression_output = prepare_train_data(test_data_np[0],N)
 
 
 pickle_filename = "/hdrive/all_users/kainverena/formatted_data/input_data.pkl"
