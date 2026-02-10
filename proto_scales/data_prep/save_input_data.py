@@ -336,7 +336,7 @@ def reorder_columns(df):
 
 def process_scenarios(experiment_scenario_path, simulation_name, baseline_scenario_path = None, delete_first_years = 0, monthly_trend = False, smoothed = True):
     """
-    Load CMIP6 baseline (piControl) and abrupt4xco2 scenario data,
+    Load CMIP6 baseline (e.g. piControl) and scenario data (e.g. abrupt4xco2),
     compute anomalies relative to the baseline scenario,
     and return:
         (1) global anomaly timeseries (annual, 21-year rolling mean)
@@ -358,39 +358,46 @@ def process_scenarios(experiment_scenario_path, simulation_name, baseline_scenar
   
 
     first_year_experiment = df_experiment['time'][0].year
-    
+
+    # shift years in scenario simulation so that first scenario simulation year is 1850 if it is smaller than 1000
     if first_year_experiment < 1000: 
         first_year_experiment_shift = 1850 - first_year_experiment
         df_experiment.time = df_experiment.time.map(lambda dt: dt.replace(year=dt.year + first_year_experiment_shift))
         first_year_experiment = df_experiment['time'][0].year
 
-    
+    # cut the last years from the scenario simulation if the simulation is longer then 350 years
+    if (df_experiment['time'].iloc[-1].year - df_experiment['time'][0].year) > 350: 
+        df_experiment = df_experiment[
+            [dt.year <= min(dt.year for dt in df_experiment['time']) + 350 for dt in df_experiment['time']]
+                ].reset_index(drop=True)
+
+    # shift years in baseline simulation so that last year is one year earlier then the first year of the scenario simulation
     last_year_baseline = df_baseline['time'].iloc[-1].year
     year_shift = (first_year_experiment - 1)  - int(last_year_baseline)
     df_baseline.time = df_baseline.time.map(lambda dt: dt.replace(year=dt.year + year_shift))
-    #df_baseline['time'] = pd.to_datetime(df_experiment['time'])
-    
+
+    # concatenate baseline and scenario simulation
     df_experiment = pd.concat([df_baseline, df_experiment]).sort_values('time').reset_index(drop=True)
 
-    if (df_experiment['time'].iloc[-1].year - df_experiment['time'][0].year) > 450: 
-        delete_additional_years = (df_experiment['time'].iloc[-1].year - df_experiment['time'][0].year) - 450
+    # if necessary: delete the first years of the concatenated simulation so that the total simulation length is 500 years maximum 
+    # and set the first year of the concatenated simulation to 1700
+    if (df_experiment['time'].iloc[-1].year - df_experiment['time'][0].year) > 500: 
+        delete_additional_years = (df_experiment['time'].iloc[-1].year - df_experiment['time'][0].year) - 500
         df_experiment = df_experiment[
             [dt.year >= min(dt.year for dt in df_experiment['time']) + delete_additional_years for dt in df_experiment['time']]
                 ].reset_index(drop=True)
 
         # Shift remaining years so first year becomes start_year
-        year_shift = 1750 -  df_experiment['time'][0].year
+        year_shift = 1700 -  df_experiment['time'][0].year
         df_experiment['time'] = df_experiment['time'].apply(lambda dt: dt.replace(year=dt.year + year_shift))
 
-    #df_experiment['time'] = df_experiment['time'].apply(
-    #lambda x: f'{str(int(x[0])+1)}{x[1:]}' if int(x[0:3]) < 1500 else x
-    #)
-    #df_experiment['time'] = pd.to_datetime(df_experiment['time'])
 
+    # shift simulation again to ensure that 1700 is the first year of the concatenated simulation 
     first_year = df_experiment['time'][0].year
-    year_shift = 1750 - int(first_year)
+    year_shift = 1700 - int(first_year)
     df_experiment.time = df_experiment.time.map(lambda dt: dt.replace(year=dt.year + year_shift))
     df_experiment['time'] = pd.to_datetime(df_experiment['time'])
+    first_year = df_experiment['time'][0].year
     
     
     region_cols = [col for col in df_experiment.columns if col.lower() != 'time']
@@ -401,22 +408,26 @@ def process_scenarios(experiment_scenario_path, simulation_name, baseline_scenar
     #    df_baseline = df_baseline.set_index("time")
     #    baseline_means = df_baseline[region_cols].mean()
     #else: 
+
+  
     df_baseline = copy.deepcopy(df_experiment)
     df_baseline['time'] = df_baseline['time'].astype(str)
     df_baseline['time'] = df_baseline['time'].apply(lambda x: datetime.strptime(x.split('.')[0], "%Y-%m-%d %H:%M:%S"))
-    #df_baseline['time'] = pd.to_datetime(df_baseline['time'])
-    df_baseline = df_baseline[(df_baseline['time'].dt.year >= 1850) & (df_baseline['time'].dt.year <= 1900)]
+
+    # calculate the mean of the first 50 years for every region 
+    df_baseline = df_baseline[(df_baseline['time'].dt.year >= first_year) & (df_baseline['time'].dt.year <= first_year+50)]
     baseline_means = df_baseline[region_cols].mean()
 
+    # delete the first years if specifically asked to do
     if delete_first_years != 0: 
         df_experiment = df_experiment[df_experiment['time'].dt.year >= df_experiment['time'].dt.year.min() + delete_first_years].reset_index(drop=True)
         # Shift remaining years so first year becomes start_year
-        year_shift = 1850 - df_experiment['time'].dt.year.min()
+        year_shift = 1700 - df_experiment['time'].dt.year.min()
         df_experiment['time'] = df_experiment['time'].apply(lambda dt: dt.replace(year=dt.year + year_shift))
 
     df_experiment = df_experiment.set_index("time")
-
-    # (B) Compute regional anomalies and apply 21-year (252-month) rolling mean
+    
+    # Calculate regional temperature anomalies in respect to the first 50 years of the baseline scenario
     df_regional_anomaly = df_experiment[region_cols] - baseline_means
     #df_regional_smoothed = df_regional_anomaly
     if monthly_trend:
