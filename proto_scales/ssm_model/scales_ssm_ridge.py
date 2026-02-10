@@ -521,10 +521,9 @@ def run_train_linear_first(
             kl_w = 5
             alpha = 10000
          
-            if(epoch>3):
-                loss = nll + kl_w * kl + alpha*roll_out_mse
-            else:
-                loss = lin_mse
+         
+            loss = nll + kl_w * kl + alpha*roll_out_mse
+            
 
             if(global_step%100==0):
                 print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item())
