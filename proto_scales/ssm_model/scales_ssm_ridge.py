@@ -224,14 +224,14 @@ def fit_ridge_D(u_train, y_train, alpha=1e-2, fit_intercept=True):
 
     if fit_intercept:
         # augment with ones column for bias
-        ones = np.ones((U.shape[0], 1), dtype=U.dtype)
+        ones = np.ones((U.shape[0], 1))#, dtype=U.dtype)
         X = np.concatenate([U, ones], axis=1)  # [M, Du+1]
     else:
         X = U  # [M, Du]
 
     # Ridge closed form: (X^T X + α I)^{-1} X^T Y
     XtX = X.T @ X
-    I = np.eye(XtX.shape[0], dtype=X.dtype)
+    I = np.eye(XtX.shape[0])#, dtype=X.dtype)
     if fit_intercept:
         # usually do NOT regularize bias
         I[-1, -1] = 0.0
