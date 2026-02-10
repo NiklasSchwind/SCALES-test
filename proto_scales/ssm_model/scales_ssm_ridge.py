@@ -441,6 +441,9 @@ def run_train_linear_first(
     u_trn = u_scaler.transform(u_tr)
     u_van = u_scaler.transform(u_va)
 
+    # Fit ridge on TRAIN only
+    W, b = fit_ridge_D(u_trn, y_trn, alpha=1e-2, fit_intercept=True)
+
     #mu_control, inv_cov_control = fit_control_mahalanobis(u_trn)
    
     train_ds = scales_ssm.UnifiedWindowDataset(y_trn, u_trn, context_len=context_len, horizon=horizon)
@@ -453,7 +456,10 @@ def run_train_linear_first(
     Dy = y_np.shape[-1]
     Du = u_np.shape[-1]
     model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Copy into model.ctrl_lin and freeze (recommended for fallback)
+    load_into_ctrl_lin(model, W, b, freeze=True)
+    #opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-3)
 
     best_val = float("inf")
     best_state = None
@@ -496,16 +502,7 @@ def run_train_linear_first(
           
             # We train on full (context+horizon) to teach dynamics across the boundary:
             y_full = torch.cat([y_ctx, y_fut], dim=1)
-            u_full = torch.cat([u_ctx, u_fut], dim=1)
-
-            
-            if(global_step ==0):
-                # Fit ridge on TRAIN only
-                W, b = fit_ridge_D(u_full, y_full, alpha=1e-2, fit_intercept=True)
-
-                # Copy into model.ctrl_lin and freeze (recommended for fallback)
-                load_into_ctrl_lin(model, W, b, freeze=True)
-                opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-3)
+            u_full = torch.cat([u_ctx, u_fut], dim=1)        
 
 
             B, T, _ = y_full.shape
