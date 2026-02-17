@@ -441,8 +441,11 @@ def run_train_linear_first(
     u_trn = u_scaler.transform(u_tr)
     u_van = u_scaler.transform(u_va)
 
+    print("data standardised.")
+
     # Fit ridge on TRAIN only
     W, b = fit_ridge_D(u_trn, y_trn, alpha=1e-2, fit_intercept=True)
+    print("ridge regression completed")
 
     #mu_control, inv_cov_control = fit_control_mahalanobis(u_trn)
    
@@ -450,6 +453,8 @@ def run_train_linear_first(
     val_ds   = scales_ssm.UnifiedWindowDataset(y_van, u_van, context_len=context_len, horizon=horizon)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_dl   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    print("dataloaders prepared")
 
     #tau_ood = pick_threshold_from_val(val_dl,mu_control,inv_cov_control)
 
