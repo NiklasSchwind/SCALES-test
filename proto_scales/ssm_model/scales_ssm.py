@@ -45,7 +45,7 @@ class UnifiedWindowDataset(Dataset):
       u_fut: [H,  Du]
       y_fut: [H,  Dy]
     """
-    def __init__(self, y, u, context_len=40, horizon=12, stride=1, start_mode="all"):
+    def __init__(self, y, u, standard_scaler_y,standard_scaler_u, context_len=40, horizon=12, stride=1, start_mode="all"):
         """
         stride: step between consecutive window starts (reduces overlap if >1)
         start_mode:
@@ -95,10 +95,10 @@ class UnifiedWindowDataset(Dataset):
         y = self.y[s]  # [T, Dy]
         u = self.u[s]  # [T, Du]
 
-        y_ctx = y[start : start + Tc]
-        u_ctx = u[start : start + Tc]
-        u_fut = u[start + Tc : start + Tc + H]
-        y_fut = y[start + Tc : start + Tc + H]
+        y_ctx = standard_scaler_y.transform(y[start : start + Tc])
+        u_ctx = standard_scaler_u.transform(u[start : start + Tc])
+        u_fut = standard_scaler_u.transform(u[start + Tc : start + Tc + H])
+        y_fut = standard_scaler_y.transform(y[start + Tc : start + Tc + H])
 
         return y_ctx, u_ctx, u_fut, y_fut
 
