@@ -438,13 +438,13 @@ def run_train_linear_first(
     print("training start")
 
     # normalize (fit on train only)
-    y_scaler = scales_ssm.StandardScaler().fit(y_tr[0:5000])
-    u_scaler = scales_ssm.StandardScaler().fit(u_tr[0:5000])
+    y_scaler = scales_ssm.StandardScaler().fit(y_tr)
+    u_scaler = scales_ssm.StandardScaler().fit(u_tr)
     print("Created standard scaler")
-    y_trn = y_scaler.transform(y_tr)
-    y_van = y_scaler.transform(y_va)
-    u_trn = u_scaler.transform(u_tr)
-    u_van = u_scaler.transform(u_va)
+    y_trn = y_scaler.transform(y_tr[0:5000])
+    # y_van = y_scaler.transform(y_va)
+    u_trn = u_scaler.transform(u_tr[0:5000])
+    # u_van = u_scaler.transform(u_va)
 
     print("data standardised.")
 
@@ -454,8 +454,10 @@ def run_train_linear_first(
 
     #mu_control, inv_cov_control = fit_control_mahalanobis(u_trn)
    
-    train_ds = scales_ssm.UnifiedWindowDataset(y_trn, u_trn, context_len=context_len, horizon=horizon)
-    val_ds   = scales_ssm.UnifiedWindowDataset(y_van, u_van, context_len=context_len, horizon=horizon)
+    train_ds = scales_ssm.UnifiedWindowDataset(y_tr, u_tr, context_len=context_len, horizon=horizon,
+    standard_scaler_u=u_scaler,standard_scaler_y = y_scaler)
+    val_ds   = scales_ssm.UnifiedWindowDataset(y_va, u_va, context_len=context_len, horizon=horizon,
+    standard_scaler_u=u_scaler,standard_scaler_y = y_scaler)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_dl   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
