@@ -436,8 +436,9 @@ def run_train_linear_first(
     print("training start")
 
     # normalize (fit on train only)
-    y_scaler = scales_ssm.StandardScaler().fit(y_tr[:5000])
-    u_scaler = scales_ssm.StandardScaler().fit(u_tr[:5000])
+    y_scaler = scales_ssm.StandardScaler().fit(y_tr[0:5000])
+    u_scaler = scales_ssm.StandardScaler().fit(u_tr[0:5000])
+    print("Created standard scaler")
     y_trn = y_scaler.transform(y_tr)
     y_van = y_scaler.transform(y_va)
     u_trn = u_scaler.transform(u_tr)
