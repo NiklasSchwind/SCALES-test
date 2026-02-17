@@ -441,10 +441,10 @@ def run_train_linear_first(
     y_scaler = scales_ssm.StandardScaler().fit(y_tr)
     u_scaler = scales_ssm.StandardScaler().fit(u_tr)
     print("Created standard scaler")
-    y_trn = y_scaler.transform(y_tr[0:5000])
-    # y_van = y_scaler.transform(y_va)
-    u_trn = u_scaler.transform(u_tr[0:5000])
-    # u_van = u_scaler.transform(u_va)
+    y_trn = y_scaler.transform(y_tr)
+    y_van = y_scaler.transform(y_va)
+    u_trn = u_scaler.transform(u_tr)
+    u_van = u_scaler.transform(u_va)
 
     print("data standardised.")
 

@@ -95,10 +95,14 @@ class UnifiedWindowDataset(Dataset):
         y = self.y[s]  # [T, Dy]
         u = self.u[s]  # [T, Du]
 
-        y_ctx = standard_scaler_y.transform(y[start : start + Tc])
-        u_ctx = standard_scaler_u.transform(u[start : start + Tc])
-        u_fut = standard_scaler_u.transform(u[start + Tc : start + Tc + H])
-        y_fut = standard_scaler_y.transform(y[start + Tc : start + Tc + H])
+        # y_ctx = standard_scaler_y.transform(y[start : start + Tc])
+        # u_ctx = standard_scaler_u.transform(u[start : start + Tc])
+        # u_fut = standard_scaler_u.transform(u[start + Tc : start + Tc + H])
+        # y_fut = standard_scaler_y.transform(y[start + Tc : start + Tc + H])
+        y_ctx = y[start : start + Tc]
+        u_ctx = u[start : start + Tc]
+        u_fut = u[start + Tc : start + Tc + H]
+        y_fut = y[start + Tc : start + Tc + H]
 
         return y_ctx, u_ctx, u_fut, y_fut
 
