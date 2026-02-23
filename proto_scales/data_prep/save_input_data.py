@@ -902,7 +902,7 @@ def shuffle_train_data(X, Y, random_state=None):
 
 MODEL = 'ACCESS-ESM1-5'
 INDICATOR = 'tas'#'pr' #'tas'
-TEST_SCENARIOS = ['ssp585']
+TEST_SCENARIOS = ['ssp245']
 #TRAIN_SCENARIOS = ['ssp585','1pctco2','ssp245'] # for "pr"
 monthly_flag = True
 use_smoothing = False
