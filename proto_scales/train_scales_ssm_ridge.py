@@ -86,7 +86,7 @@ if __name__ == "__main__":
 
     device = "cuda"
 
-    model, y_scaler, u_scaler = scales_ssm_ridge.run_train_linear_first(y, u, context_len=50, z_dim=24,horizon=160, device=device,epochs=10,batch_size=250)
+    model, y_scaler, u_scaler = scales_ssm_ridge.run_train_linear_first(y, u, context_len=50, z_dim=24,horizon=150, device=device,epochs=10,batch_size=250)
     os.makedirs("outputs_ssm_scales", exist_ok=True)
     torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
     y_scaler.save("outputs_ssm_scales/y_scaler.out")
