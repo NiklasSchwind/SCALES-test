@@ -251,7 +251,7 @@ class DeepSSMPatternConditioned(nn.Module):
         sigma_y = torch.exp(torch.clamp(self.log_sigma_y, -6.0, 3.0))
 
         ysamps = []
-        y_samps_pr = []
+        ysamps_pr = []
         for _ in range(n_samples):
             z = self.sample(mu_qT, logvar_qT)
 
