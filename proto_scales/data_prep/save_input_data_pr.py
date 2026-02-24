@@ -911,7 +911,7 @@ N = 200
 ML_MODEL = 'feed_forward'
 PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
-train_pattern_scaling_name = 'ssp245'#'ssp585'#'flat10cdrincspinoff'
+train_pattern_scaling_name = 'ssp585'#'ssp585'#'flat10cdrincspinoff'
 
 MODEL_PATH = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 
