@@ -921,7 +921,7 @@ MODEL_PATH = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 #    warnings.simplefilter("ignore")
 
 # get all files available for the model
-potential_files = get_all_files(MODEL_PATH)
+potential_files = get_all_files_(MODEL_PATH)
 
 # get all files for tas indicator
 train_files_tas = filter_climate_files(files = potential_files, scenarios = TRAIN_SCENARIOS, indicators = ['tas'])
