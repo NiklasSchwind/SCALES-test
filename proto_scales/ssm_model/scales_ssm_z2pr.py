@@ -27,7 +27,7 @@ class UnifiedWindowDataset(Dataset):
           - "zero": only start at 0 for each series (behaves like your WindowDataset)
         """
         y = np.asarray(y, dtype=np.float32)
-        pr = np.asarray(pe, dtype=np.float32)
+        pr = np.asarray(pr, dtype=np.float32)
         u = np.asarray(u, dtype=np.float32)
 
         # Normalize shapes to [N, T, D]
@@ -114,7 +114,7 @@ class DeepSSMPatternConditioned(nn.Module):
 
         # global observation noise (log sigma); initialized modestly
         self.log_sigma_y = nn.Parameter(torch.tensor(-0.2))
-        self.log_sima_pr = nn.Parameter(torch.tensor(-0.2))
+        self.log_sigma_pr = nn.Parameter(torch.tensor(-0.2))
 
     def sample(self, mu, logvar):
         eps = torch.randn_like(mu)
@@ -140,7 +140,7 @@ class DeepSSMPatternConditioned(nn.Module):
         logvar_p0 = torch.zeros(B, self.z_dim, device=y.device)
 
         sigma_y = torch.exp(torch.clamp(self.log_sigma_y, -6.0, 3.0))
-        sigma_pr = torch.exp(torch.clamp(self.log_sima_pr, -6.0, 3.0))
+        sigma_pr = torch.exp(torch.clamp(self.log_sigma_pr, -6.0, 3.0))
 
         nll = 0.0
         nll_pr = 0.0
@@ -199,10 +199,10 @@ class DeepSSMPatternConditioned(nn.Module):
         logvar_qT = torch.clamp(logvar_qT, -12.0, 6.0)
 
         sigma_y = torch.exp(torch.clamp(self.log_sigma_y, -6.0, 3.0))
-        sigma_pr = torch.exp(torch.clamp(self.log_sima_pr, -6.0, 3.0))
+        sigma_pr = torch.exp(torch.clamp(self.log_sigma_pr, -6.0, 3.0))
 
         ysamps = []
-        y_samps_pr = []
+        ysamps_pr = []
         for _ in range(n_samples):
             z = self.sample(mu_qT, logvar_qT)
 
@@ -554,4 +554,4 @@ def run_train(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    return model, y_scaler, u_scaler#,mu_control,inv_cov_control,tau_ood
+    return model, y_scaler, u_scaler, pr_scaler#,mu_control,inv_cov_control,tau_ood
