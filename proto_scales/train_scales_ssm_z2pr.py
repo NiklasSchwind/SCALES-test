@@ -2,7 +2,7 @@
 import os
 import proto_scales.data_prep.prepare_data as prep
 import torch
-import proto_scales.ssm_model.scales_ssm_ridge as scales_ssm_ridge
+import proto_scales.ssm_model.scales_ssm_z2pr as scales_ssm_z2pr
 import numpy as np
 import pickle
 
@@ -111,14 +111,19 @@ if __name__ == "__main__":
     train_data_shuffeled = prep.shuffle_train_data(train_data_input, train_data_output, random_state=42)
 
     u = train_data_shuffeled[0][0,:].T[..., None]
-    #y = np.transpose(train_data_shuffeled[0][44:48,:],(2, 1, 0))
     y = np.transpose(train_data_shuffeled[0],(2, 1, 0))
-    print(u.shape)
-    print(y.shape)
-
+    y = y[:,:,1:]
+    regions = int(y.shape[-1]/2)
+    print(regions)
+    tas = y[:,:,:regions]
+    pr = y[:,:,-regions:]
+    print("tas ",tas.shape)
+    print("GMT ",u.shape)
+    print("pr ",pr.shape)
+  
     device = "cuda"
 
-    model, y_scaler, u_scaler,pr_scaler = scales_ssm_ridge.run_train_linear_first(y, u, context_len=50, z_dim=24,horizon=150, device=device,epochs=10,batch_size=250)
+    model, y_scaler, u_scaler,pr_scaler = scales_ssm_ridge.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, device=device,epochs=10,batch_size=250)
     os.makedirs("outputs_ssm_scales", exist_ok=True)
     torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
     y_scaler.save("outputs_ssm_scales/y_scaler.out")
