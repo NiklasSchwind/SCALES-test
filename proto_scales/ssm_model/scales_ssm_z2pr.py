@@ -308,7 +308,7 @@ def mahalanobis_score(u_fut_norm, mu, inv_cov):
 
 def pick_threshold_from_val(val_loader, mu, inv_cov, percentile=99.0):
     all_scores = []
-    for _, _, u_fut, _ in val_loader:
+    for _, _,_, u_fut,_, _ in val_loader:
         s = mahalanobis_score(u_fut.numpy(), mu, inv_cov)  # [B,H]
         all_scores.append(s.reshape(-1))
     all_scores = np.concatenate(all_scores)
