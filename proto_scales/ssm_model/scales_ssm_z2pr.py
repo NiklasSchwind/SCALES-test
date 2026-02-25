@@ -486,7 +486,7 @@ def run_train(
             kl_w = frac  # 0->1
             kl_w = 5
             alpha = 10000
-            omega = 1
+            omega = 100
          
          
             loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr
