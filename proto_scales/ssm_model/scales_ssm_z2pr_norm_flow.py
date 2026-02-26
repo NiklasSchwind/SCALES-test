@@ -183,7 +183,6 @@ class DeepSSMPatternConditioned(nn.Module):
         logvar_p0 = torch.zeros(B, self.z_dim, device=y.device)
 
         sigma_y = torch.exp(torch.clamp(self.log_sigma_y, -6.0, 3.0))
-        sigma_pr = torch.exp(torch.clamp(self.log_sigma_pr, -6.0, 3.0))
 
         nll = 0.0
         nll_pr = 0.0
