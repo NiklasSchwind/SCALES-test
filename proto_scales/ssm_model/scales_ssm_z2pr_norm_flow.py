@@ -149,7 +149,7 @@ class DeepSSMPatternConditioned(nn.Module):
         emit_in = z_dim + (u_dim if emission_uses_u else 0)
         self.emit = scales_ssm.MLP(emit_in, y_dim, hidden=mlp_hidden)
 
-        self.emit_pr = scales_ssm.MLP(emit_in,4*y_dim,hidden = mlp_hidden)
+        self.emit_pr = scales_ssm.MLP(emit_in,4*y_dim,hidden = 230)
 
         #pattern scaling like head for emission
         self.ctrl_lin = nn.Linear(u_dim, y_dim,bias=True)
