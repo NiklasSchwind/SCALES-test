@@ -212,7 +212,7 @@ class DeepSSMPatternConditioned(nn.Module):
 
             # NLL under conditional flow emission
             nll_pr_t = sinh_arcsinh_flow_nll_conditional(
-                y[:, t], mu_t, log_sigma_t, eps_skew_t, log_delta_t, eps=self.eps
+                pr[:, t], mu_t, log_sigma_t, eps_skew_t, log_delta_t, eps=self.eps
             )
             nll_pr = nll_pr + nll_pr_t
 
