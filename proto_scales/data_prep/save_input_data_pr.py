@@ -902,7 +902,7 @@ def shuffle_train_data(X, Y, random_state=None):
 
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr'] #'tas'
-TEST_SCENARIOS = ['ssp585']
+TEST_SCENARIOS = ['ssp245']
 #TRAIN_SCENARIOS = ['ssp585','1pctco2','ssp245'] # for "pr"
 monthly_flag = True
 use_smoothing = False
@@ -993,7 +993,8 @@ with open(pickle_filename, 'wb') as file:
     pickle.dump(train_data_input, file)
     pickle.dump(train_data_output, file)
     pickle.dump(test_data_for_autoregression_input,file)
-    #pickle.dump(test_data_np,file)
+    pickle.dump(test_data_input,file) 
+    pickle.dump(test_data_np,file)  
     #pickle.dump(test_data_input, file)
     #pickle.dump(test_data_output, file)
 
