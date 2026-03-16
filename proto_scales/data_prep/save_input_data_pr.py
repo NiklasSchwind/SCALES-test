@@ -992,8 +992,7 @@ pickle_filename = "/hdrive/all_users/kainverena/formatted_data/input_data.pkl"
 with open(pickle_filename, 'wb') as file:
     pickle.dump(train_data_input, file)
     pickle.dump(train_data_output, file)
-    pickle.dump(test_data_for_autoregression_input,file)
-    pickle.dump(test_data_input,file) 
+    pickle.dump(test_data_for_autoregression_input,file) 
     pickle.dump(test_data_np,file)  
     #pickle.dump(test_data_input, file)
     #pickle.dump(test_data_output, file)
