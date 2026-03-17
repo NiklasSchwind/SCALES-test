@@ -441,10 +441,10 @@ def process_scenarios(experiment_scenario_path, simulation_name, baseline_scenar
             )
 
         df_global = pd.DataFrame({
-        'time': df_experiment.index,
+        'time': df_regional_smoothed.index,
         'GMT': df_regional_smoothed.GLOBAL#df_regional_smoothed.mean(axis=1)
             }).set_index('time')
-    
+        
         
     else:
         #df_regional_smoothed = df_regional_anomaly.rolling(window=21*12, center = True).mean()
@@ -475,6 +475,7 @@ def process_scenarios(experiment_scenario_path, simulation_name, baseline_scenar
     # Remove GMT from regional temperature timeseries
     
     df_regional_smoothed.drop(columns=['GLOBAL'], inplace = True)
+    df_regional_smoothed = df_regional_smoothed.sort_index()
    
     return df_global_annual, df_regional_smoothed
 
