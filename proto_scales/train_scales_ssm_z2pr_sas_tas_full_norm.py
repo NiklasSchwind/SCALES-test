@@ -34,9 +34,13 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    MODEL_PATH = MODEL_PATH_IIASA
+   
     if(args.cluster == "ASC"):
         MODEL_PATH = MODEL_PATH_ASC
+    else:
+        MODEL_PATH = MODEL_PATH_IIASA
+    
+    print("MODEL_PATH", MODEL_PATH)
 
     # get all files available for the model
     potential_files = prep.get_all_files_(MODEL_PATH)
