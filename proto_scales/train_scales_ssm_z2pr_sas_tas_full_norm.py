@@ -39,7 +39,7 @@ if __name__ == "__main__":
         MODEL_PATH = MODEL_PATH_ASC
 
     # get all files available for the model
-    potential_files = prep.get_all_files(MODEL_PATH)
+    potential_files = prep.get_all_files_(MODEL_PATH)
 
     # get all files for tas indicator
     train_files_tas = prep.filter_climate_files(files = potential_files, scenarios = TRAIN_SCENARIOS, indicators = ['tas'])
