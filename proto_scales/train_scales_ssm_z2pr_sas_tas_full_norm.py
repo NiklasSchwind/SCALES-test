@@ -6,6 +6,7 @@ import proto_scales.ssm_model.scales_ssm_z2pr_sas_tas_full_norm as scales_ssm_z2
 import numpy as np
 import pickle
 import argparse
+import pandas as pd
 
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
