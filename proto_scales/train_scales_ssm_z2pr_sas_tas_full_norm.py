@@ -44,6 +44,7 @@ if __name__ == "__main__":
 
     # get all files available for the model
     potential_files = prep.get_all_files_(MODEL_PATH)
+    print("potential files ",potential_files)
 
     # get all files for tas indicator
     train_files_tas = prep.filter_climate_files(files = potential_files, scenarios = TRAIN_SCENARIOS, indicators = ['tas'])
