@@ -20,7 +20,7 @@ use_smoothing = False
 train_pattern_scaling_name = 'ssp585'
 
 MODEL_PATH_IIASA = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
-MODEL_PATH_ASC = f'$DATA/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
+MODEL_PATH_ASC = f'/gpfs/data/fs73093/kain/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 
 if __name__ == "__main__":
 
