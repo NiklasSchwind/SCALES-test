@@ -890,3 +890,78 @@ def shuffle_train_data(X, Y, random_state=None):
     Y_shuffled = Y[:, indices]      # shuffle along last axis
 
     return X_shuffled, Y_shuffled
+
+def fetch_and_massage_data(
+        model_path:str,
+        train_scenarios:List[str],
+        indicators:List[str],use_smoothing:bool,
+        monthly_flag:bool,
+        pattern_scaling_residuals:bool,
+        ramp_down_corrected_ps:bool
+        ):
+    assert 'tas' in indicators
+    potential_files = get_all_files_(model_path)
+    train_files_tas = filter_climate_files(files = potential_files, scenarios = train_scenarios, indicators = ['tas'])
+    train_files_with_baseline_tas = [(get_baseline_filename(filename=filename, files= potential_files), filename) for filename in train_files_tas]
+    train_data_df_tas = [process_scenarios(experiment_scenario_path = f'{model_path}/{experiment}', simulation_name = experiment, 
+        baseline_scenario_path = f'{model_path}/{baseline}', 
+        delete_first_years = 0, monthly_trend = monthly_flag, smoothed = use_smoothing) for (baseline,experiment) in train_files_with_baseline_tas]
+    train_data_gmt = [train_data_df_tas[i][0] for i in range(len(train_data_df_tas))]
+    train_data_regional_temps = [train_data_df_tas[i][1].add_suffix("_tas") for i in range(len(train_data_df_tas))]
+
+    regional_averages_indicators_train = []
+
+    for indicator in indicators:
+        if indicator == 'tas': 
+    
+            regional_averages_indicators_train.append(train_data_regional_temps)
+        else: 
+            train_files_with_baseline_indicator = [(baseline_file.replace('tas', indicator), experiment_file.replace('tas', indicator)) for (baseline_file, experiment_file) in train_files_with_baseline_tas]
+            train_data_df_indicator = [process_scenarios(experiment_scenario_path = f'{model_path}/{experiment}', 
+                simulation_name = experiment, baseline_scenario_path = f'{model_path}/{baseline}', delete_first_years = 0, 
+                monthly_trend = monthly_flag, smoothed = use_smoothing) for (baseline,experiment) in train_files_with_baseline_indicator]
+            train_data_regional_indicator = [train_data_df_indicator[i][1].add_suffix(f"_{indicator}") for i in range(len(train_data_df_indicator))]
+            regional_averages_indicators_train.append(train_data_regional_indicator)
+    
+    train_data_df = [(train_data_gmt[i],pd.concat([regional_averages_indicator[i] for regional_averages_indicator in regional_averages_indicators_train], axis = 1)) for i in range(len(train_data_gmt))]
+
+    if pattern_scaling_residuals:
+        flat10cdr_index = [i for i, f in enumerate(train_files_tas) if train_pattern_scaling_name in f][0]
+        regional_regression_slopes_intersepts = process_gmt_and_regions_into_array(train_data_df[flat10cdr_index], weighted_linear_smoothing = False, pattern_scaling_residuals=pattern_scaling_residuals)
+        train_data_np = [process_gmt_and_regions_into_array(GMT_regional_values_tuple, weighted_linetar_smoothing = False, 
+            pattern_scaling_residuals=pattern_scaling_residuals, 
+            slope_intercept = regional_regression_slopes_intersepts,ramp_down_corrected_ps=ramp_down_corrected_ps) for GMT_regional_values_tuple in train_data_df]
+    else:
+        flat10cdr_index = [i for i, f in enumerate(train_files_tas) if train_pattern_scaling_name in f][0]
+        regional_regression_slopes_intersepts = process_gmt_and_regions_into_array(train_data_df[flat10cdr_index], weighted_linear_smoothing = False, pattern_scaling_residuals=True,ramp_down_corrected_ps =ramp_down_corrected_ps)
+        train_data_np = [process_gmt_and_regions_into_array(GMT_regional_values_tuple, weighted_linear_smoothing = False,ramp_down_corrected_ps =ramp_down_corrected_ps) for GMT_regional_values_tuple in train_data_df]
+       
+    return train_data_np
+
+def fetch_and_shuffle_data(
+        model_path:str,
+        train_scenarios:List[str],
+        indicators:List[str],
+        use_smoothing:bool,
+        monthly_flag:bool,
+        pattern_scaling_residuals:bool,
+        ramp_down_corrected_ps:bool,
+        sample_length:int=200,
+        random_state=42
+        ):
+    
+    train_data_np = fetch_and_massage_data(
+        model_path=model_path,
+        train_scenarios=train_scenarios,
+        indicators=indicators,
+        use_smoothing=use_smoothing,
+        monthly_flag=monthly_flag,
+        pattern_scaling_residuals=pattern_scaling_residuals,
+        ramp_down_corrected_ps=ramp_down_corrected_ps      
+    )
+    train_data_input, train_data_output = prepare_all_train_data(train_data_np, n=sample_length)
+    train_data_shuffeled = shuffle_train_data(train_data_input, train_data_output, random_state=random_state)
+
+    return train_data_shuffeled
+
+
