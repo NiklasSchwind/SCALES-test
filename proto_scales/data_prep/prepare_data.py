@@ -933,8 +933,6 @@ def fetch_and_massage_data(
             pattern_scaling_residuals=pattern_scaling_residuals, 
             slope_intercept = regional_regression_slopes_intersepts,ramp_down_corrected_ps=ramp_down_corrected_ps) for GMT_regional_values_tuple in train_data_df]
     else:
-        flat10cdr_index = [i for i, f in enumerate(train_files_tas) if train_pattern_scaling_name in f][0]
-        regional_regression_slopes_intersepts = process_gmt_and_regions_into_array(train_data_df[flat10cdr_index], weighted_linear_smoothing = False, pattern_scaling_residuals=True,ramp_down_corrected_ps =ramp_down_corrected_ps)
         train_data_np = [process_gmt_and_regions_into_array(GMT_regional_values_tuple, weighted_linear_smoothing = False,ramp_down_corrected_ps =ramp_down_corrected_ps) for GMT_regional_values_tuple in train_data_df]
        
     return train_data_np
