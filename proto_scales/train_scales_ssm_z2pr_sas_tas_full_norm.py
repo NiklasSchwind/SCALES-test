@@ -11,7 +11,7 @@ import pandas as pd
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
 TEST_SCENARIOS = ['ssp245']
-TRAIN_SCENARIOS = [ 'ssp585','1pctco2']#,'ssp534-over','flat10cdrincspinoff','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
+TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp534-over','flat10cdrincspinoff','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff',"ssp370","ssp460","ssp245"]#,'abrupt4xco2','ssp119','ssp460','ssp370']
 N = 200
 ML_MODEL = 'feed_forward' 
 PATTERN_SCALING_RESIDUALS = False
@@ -45,7 +45,6 @@ if __name__ == "__main__":
 
     # get all files available for the model
     potential_files = prep.get_all_files_(MODEL_PATH)
-    print("potential files ",potential_files)
 
     # get all files for tas indicator
     train_files_tas = prep.filter_climate_files(files = potential_files, scenarios = TRAIN_SCENARIOS, indicators = ['tas'])
