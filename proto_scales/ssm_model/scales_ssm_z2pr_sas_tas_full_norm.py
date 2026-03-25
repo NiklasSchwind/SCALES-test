@@ -11,6 +11,9 @@ import torch
 import torch.nn.functional as F
 import math
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 def sinh_arcsinh_flow_nll_conditional(y, mu, log_sigma, eps_skew, log_delta, eps=1e-6):
     """
     Conditional elementwise Sinh–Arcsinh flow emission.
@@ -451,6 +454,14 @@ def run_train(
     z_dim=16,
     device="cpu",
 ):
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    use_cuda = torch.cuda.is_available()
+    backend = "nccl" if use_cuda else "gloo"
+    dist.init_process_group(backend)
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+
     # split
     N = y_np.shape[0]
     idx = np.random.permutation(N)
@@ -496,6 +507,9 @@ def run_train(
     model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim).to(device)
     # Copy into model.ctrl_lin and freeze (recommended for fallback)
     load_into_ctrl_lin(model, W, b, freeze=True)
+    ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank} if use_cuda else {}
+    model = DDP(model, **ddp_kwargs)
+
     #opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-3)
 
