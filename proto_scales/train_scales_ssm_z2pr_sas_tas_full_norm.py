@@ -12,7 +12,7 @@ MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
 TEST_SCENARIOS = ['ssp245']
 TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp534-over','ssp126',"ssp370","ssp460","ssp245"]#,''flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt4xco2','ssp119','ssp460','ssp370']
-N = 200
+N = 150
 ML_MODEL = 'feed_forward' 
 PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
@@ -141,7 +141,7 @@ if __name__ == "__main__":
   
     device = "cuda"
 
-    model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, device=device,epochs=10,batch_size=250)
+    model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=50, z_dim=24,horizon=100, device=device,epochs=10,batch_size=250)
     os.makedirs("outputs_ssm_scales", exist_ok=True)
     torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
     y_scaler.save("outputs_ssm_scales/y_scaler.out")
