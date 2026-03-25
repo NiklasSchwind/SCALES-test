@@ -1,5 +1,7 @@
 
 import os
+import traceback
+import faulthandler
 import proto_scales.data_prep.prepare_data as prep
 import torch
 import proto_scales.ssm_model.scales_ssm_z2pr_sas_tas_full_norm as scales_ssm_z2pr
@@ -24,6 +26,9 @@ MODEL_PATH_IIASA = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 MODEL_PATH_ASC = f'/gpfs/data/fs73093/kain/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 
 if __name__ == "__main__":
+
+    faulthandler.enable()
+    _local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     parser = argparse.ArgumentParser(description="SSM model for climate projections")
     
@@ -141,7 +146,13 @@ if __name__ == "__main__":
   
     device = "cuda"
 
-    model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, device=device,epochs=10,batch_size=250)
+    try:
+        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, device=device,epochs=10,batch_size=250)
+    except Exception:
+        print(f"[Rank {_local_rank}] run_train failed:", flush=True)
+        traceback.print_exc()
+        raise
+
     os.makedirs("outputs_ssm_scales", exist_ok=True)
     torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
     y_scaler.save("outputs_ssm_scales/y_scaler.out")
