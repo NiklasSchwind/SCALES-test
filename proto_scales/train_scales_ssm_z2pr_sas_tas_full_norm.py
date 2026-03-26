@@ -13,8 +13,9 @@ import pandas as pd
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
 TEST_SCENARIOS = ['ssp245']
-TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp126']#"ssp460","ssp245"]#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt4xco2','ssp119','ssp460','ssp370']
+TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp126',"ssp460","ssp245"]#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt4xco2','ssp119','ssp460','ssp370']
 N = 200
+n_skip = 100
 ML_MODEL = 'feed_forward' 
 PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
@@ -112,7 +113,7 @@ if __name__ == "__main__":
         #test_data_np = [prep.process_gmt_and_regions_into_array(GMT_regional_values_tuple, weighted_linear_smoothing = False, ramp_down_corrected_ps = RAMP_DOWN_CORRECTED_PS) for GMT_regional_values_tuple in test_data_df]
     
     print("created train_data_np")
-    train_data_input, train_data_output = prep.prepare_all_train_data(train_data_np, n=N)
+    train_data_input, train_data_output = prep.prepare_all_train_data(train_data_np, n=N, n_skip=n_skip)
     #test_data_input, test_data_output = prep.prepare_all_train_data(test_data_np, n=N)
     print("created train_input_data")
     

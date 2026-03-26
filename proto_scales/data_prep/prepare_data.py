@@ -819,48 +819,46 @@ def process_gmt_and_regions_into_array(
 
 
 
-def prepare_train_data(data,n):
-    """ 
+def prepare_train_data(data, n, n_skip=1):
+    """
     data: array with shape (1 + number_regions, number_timesteps)
     n: window size length
+    n_skip: number of time steps to be skipped for building timeseries data
     """
     regions, timesteps = data.shape
     first_region = data[0]   # shape: (timesteps,)
     other_regions = data[1:] # shape: (number_regions, timesteps)
 
-    # Number of valid training windows
+    # Indices of valid training windows after applying skip
     num_samples = timesteps - n - 1
+    indices = np.arange(0, num_samples, n_skip)
+    actual_samples = len(indices)
 
-    # X shape target: (regions, n, num_samples)
-    X = np.zeros((regions, n, num_samples))
+    # X shape: (regions, n, actual_samples)
+    X = np.zeros((regions, n, actual_samples))
+    # Y shape: (number_regions, actual_samples)
+    Y = np.zeros((regions - 1, actual_samples))
 
-    for i in range(num_samples):  # x goes from n to timesteps-1
-        # First region: t[x-n] ... t[x]  (length n)
-        X[0, :, i] = first_region[(i+1):(i+n+1)]
-
-        # Other regions: t[x-n-1] ... t[x-1] (also length n)
-        X[1:, :, i] = other_regions[:, i:(i+n)]
-
-    # Y shape target: (number_regions, num_samples)
-    Y = np.zeros((regions - 1, num_samples))
-
-    # At time t[x], take all region values except the first one
-    Y[:, :] = other_regions[:, (n+1):]  # n to end: timesteps - n samples
+    for out_idx, i in enumerate(indices):
+        X[0, :, out_idx] = first_region[(i+1):(i+n+1)]
+        X[1:, :, out_idx] = other_regions[:, i:(i+n)]
+        Y[:, out_idx] = other_regions[:, i+n]
 
     return X, Y
 
-def prepare_all_train_data(data_arrays, n):
+def prepare_all_train_data(data_arrays, n, n_skip=1):
     """
     data_arrays: list of arrays, each shape (1 + number_regions, number_timesteps)
     n: window size length
+    n_skip: number of time steps to be skipped for building timeseries data
     """
 
     X_list = []
     Y_list = []
 
     for data in data_arrays:
-        
-        X, Y = prepare_train_data(data,n)
+
+        X, Y = prepare_train_data(data, n, n_skip)
 
         X_list.append(X)
         Y_list.append(Y)
