@@ -452,7 +452,6 @@ def run_train(
     epochs=50,
     lr=2e-3,
     z_dim=16,
-    device="cpu",
 ):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -461,6 +460,7 @@ def run_train(
     dist.init_process_group(backend)
     if use_cuda:
         torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}") if use_cuda else torch.device("cpu")
 
     # split
     N = y_np.shape[0]
@@ -492,7 +492,7 @@ def run_train(
     print("ridge regression completed")
 
     #mu_control, inv_cov_control = fit_control_mahalanobis(u_trn)
-   
+
     train_ds = UnifiedWindowDataset(y_trn, pr_trn, u_trn, context_len=context_len, horizon=horizon)
     val_ds   = UnifiedWindowDataset(y_van, pr_van, u_van, context_len=context_len, horizon=horizon)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -504,11 +504,11 @@ def run_train(
 
     Dy = y_np.shape[-1]
     Du = u_np.shape[-1]
-    model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim).to(device)
-    # Copy into model.ctrl_lin and freeze (recommended for fallback)
-    load_into_ctrl_lin(model, W, b, freeze=True)
+    raw_model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim).to(device)
+    # Copy into raw_model.ctrl_lin and freeze (recommended for fallback)
+    load_into_ctrl_lin(raw_model, W, b, freeze=True)
     ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank} if use_cuda else {}
-    model = DDP(model, **ddp_kwargs)
+    model = DDP(raw_model, **ddp_kwargs)
 
     #opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-3)
@@ -516,43 +516,43 @@ def run_train(
     best_val = float("inf")
     best_state = None
     patience, patience_left = 15, 15
-  
+
     # KL annealing schedule: ramp from 0 -> 1 over first ~30% of training
     total_steps = epochs * len(train_dl)
     global_step = 0
 
     for epoch in range(1, epochs + 1):
-       
+
         model.train()
-        
+
         tr_loss = []
 
         for y_ctx, pr_ctx,u_ctx, u_fut, pr_fut,y_fut in train_dl:
-            
-           
+
+
             y_ctx = torch.tensor(y_ctx, device=device)
             pr_ctx = torch.tensor(pr_ctx, device=device)
             u_ctx = torch.tensor(u_ctx, device=device)
             u_fut = torch.tensor(u_fut, device=device)
             y_fut = torch.tensor(y_fut, device=device)
             pr_fut = torch.tensor(pr_fut, device=device)
-          
+
             # We train on full (context+horizon) to teach dynamics across the boundary:
             y_full = torch.cat([y_ctx, y_fut], dim=1)
             pr_full = torch.cat([pr_ctx, pr_fut], dim=1)
-            u_full = torch.cat([u_ctx, u_fut], dim=1)        
+            u_full = torch.cat([u_ctx, u_fut], dim=1)
 
 
             B, T, _ = y_full.shape
-       
-            nll, kl, nll_pr = model.forward_elbo(y_full, pr_full, u_full, kl_free_bits=0.2)
-            mean, _, _ ,mean_pr,_,_= model.forecast_deterministic(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
+
+            nll, kl, nll_pr = raw_model.forward_elbo(y_full, pr_full, u_full, kl_free_bits=0.2)
+            mean, _, _ ,mean_pr,_,_= raw_model.forecast_deterministic(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
             roll_out_mse =((mean - y_fut) ** 2).mean()
             roll_out_mse_pr = ((mean_pr - pr_fut) ** 2).mean()
-            lin_mean = model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
+            lin_mean = raw_model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
             lin_mse = ((lin_mean-y_full)**2).mean()
-            
-           
+
+
             # anneal KL weight
             global_step += 1
             frac = min(1.0, global_step / int(0.3 * total_steps))
@@ -560,33 +560,33 @@ def run_train(
             kl_w = 5
             alpha = 10000
             omega = 100
-         
-         
+
+
             loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr
-            
+
 
             if(global_step%100==0):
                 print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item(),nll_pr.item(),roll_out_mse_pr.item())
-            
+
             opt.zero_grad()
             loss.backward()
-            
+
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-           
+
             opt.step()
-           
+
 
             tr_loss.append(loss.item())
 
         # validation: one-step objective + forecast MSE on horizon
         model.eval()
-        
+
         va_loss = []
         va_mse = []
 
         with torch.no_grad():
             for y_ctx, pr_ctx, u_ctx, u_fut, pr_fut,y_fut in val_dl:
-                
+
                 y_ctx = torch.tensor(y_ctx, device=device)
                 pr_ctx = torch.tensor(pr_ctx, device=device)
                 u_ctx = torch.tensor(u_ctx, device=device)
@@ -598,8 +598,8 @@ def run_train(
                 u_full = torch.cat([u_ctx, u_fut], dim=1)
                 pr_full = torch.cat([pr_ctx, pr_fut], dim=1)
 
-                nll, kl, nll_pr = model.forward_elbo(y_full, pr_full, u_full, kl_free_bits=0.2)
-                mean, _, _,mean_pr,_,_ = model.forecast(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
+                nll, kl, nll_pr = raw_model.forward_elbo(y_full, pr_full, u_full, kl_free_bits=0.2)
+                mean, _, _,mean_pr,_,_ = raw_model.forecast(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
                 mse = ((mean - y_fut) ** 2).mean().item()
                 mse_pr = ((mean_pr - pr_fut) ** 2).mean().item()
                 loss = nll + nll_pr + kl_w * kl + alpha*mse + omega*mse_pr
@@ -611,12 +611,12 @@ def run_train(
         mse = float(np.mean(va_mse))
         print(f"epoch {epoch:03d} | train {tr:.4f} | val_elbo {va:.4f} | val_mse {mse:.4f}")
         os.makedirs("outputs_ssm_scales", exist_ok=True)
-        torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
+        torch.save(raw_model.state_dict(),"outputs_ssm_scales/model_out")
 
         # early stopping on val_elbo
         if va < best_val - 1e-4:
             best_val = va
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
             patience_left = patience
         else:
             patience_left -= 1
@@ -625,6 +625,6 @@ def run_train(
                 break
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        raw_model.load_state_dict(best_state)
 
-    return model, y_scaler, u_scaler, pr_scaler#,mu_control,inv_cov_control,tau_ood
+    return raw_model, y_scaler, u_scaler, pr_scaler#,mu_control,inv_cov_control,tau_ood
