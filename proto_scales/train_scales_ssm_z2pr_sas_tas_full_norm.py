@@ -22,6 +22,7 @@ RAMP_DOWN_CORRECTED_PS = False
 monthly_flag = True
 use_smoothing = False
 train_pattern_scaling_name = 'ssp585'
+epochs = 200
 
 MODEL_PATH_IIASA = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 MODEL_PATH_ASC = f'/gpfs/data/fs73093/kain/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
@@ -151,7 +152,7 @@ if __name__ == "__main__":
     device = "cuda"
 
     try:
-        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, epochs=20,batch_size=250)
+        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, epochs=epochs,batch_size=250)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()
