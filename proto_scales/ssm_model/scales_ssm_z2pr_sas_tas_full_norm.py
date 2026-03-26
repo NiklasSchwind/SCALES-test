@@ -620,9 +620,9 @@ def run_train(
             patience_left = patience
         else:
             patience_left -= 1
-            if patience_left <= 0:
-                print("Early stopping.")
-                break
+            # if patience_left <= 0:
+            #     print("Early stopping.")
+            #     break
 
     if best_state is not None:
         raw_model.load_state_dict(best_state)

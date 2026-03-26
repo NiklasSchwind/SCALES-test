@@ -13,7 +13,7 @@ import pandas as pd
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
 TEST_SCENARIOS = ['ssp245']
-TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp126',"ssp460","ssp245"]#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt4xco2','ssp119','ssp460','ssp370']
+TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp126','ssp460','ssp245','ssp534-over']#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt4xco2','ssp119','ssp460','ssp370']
 N = 200
 n_skip = 100
 ML_MODEL = 'feed_forward' 
@@ -22,7 +22,7 @@ RAMP_DOWN_CORRECTED_PS = False
 monthly_flag = True
 use_smoothing = False
 train_pattern_scaling_name = 'ssp585'
-epochs = 200
+epochs = 300
 
 MODEL_PATH_IIASA = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 MODEL_PATH_ASC = f'/gpfs/data/fs73093/kain/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
