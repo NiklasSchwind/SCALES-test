@@ -151,7 +151,7 @@ if __name__ == "__main__":
     device = "cuda"
 
     try:
-        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, device=device,epochs=10,batch_size=250)
+        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=24,horizon=100, epochs=20,batch_size=250)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()
