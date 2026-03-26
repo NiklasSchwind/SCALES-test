@@ -111,9 +111,10 @@ if __name__ == "__main__":
         train_data_np = [prep.process_gmt_and_regions_into_array(GMT_regional_values_tuple, weighted_linear_smoothing = False,ramp_down_corrected_ps = RAMP_DOWN_CORRECTED_PS) for GMT_regional_values_tuple in train_data_df]
         #test_data_np = [prep.process_gmt_and_regions_into_array(GMT_regional_values_tuple, weighted_linear_smoothing = False, ramp_down_corrected_ps = RAMP_DOWN_CORRECTED_PS) for GMT_regional_values_tuple in test_data_df]
     
+    print("created train_data_np")
     train_data_input, train_data_output = prep.prepare_all_train_data(train_data_np, n=N)
     #test_data_input, test_data_output = prep.prepare_all_train_data(test_data_np, n=N)
-    
+    print("created train_input_data")
     
     
     #test_data_for_autoregression_input, test_data_for_autoregression_output = prep.prepare_train_data(test_data_np[0],N)
