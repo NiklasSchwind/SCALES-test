@@ -896,7 +896,7 @@ def fetch_and_massage_data(
         monthly_flag:bool,
         pattern_scaling_residuals:bool,
         train_pattern_scaling_name:str,
-        ramp_down_corrected_ps:bool
+        ramp_down_corrected_ps:bool,
         ):
     assert 'tas' in indicators
     potential_files = get_all_files_(model_path)
@@ -945,7 +945,9 @@ def fetch_and_shuffle_data(
         train_pattern_scaling_name:str,
         ramp_down_corrected_ps:bool,
         sample_length:int=200,
-        random_state=42
+        random_state=42,
+        n_skip:int=1,
+
         ):
     
     train_data_np = fetch_and_massage_data(
@@ -958,7 +960,7 @@ def fetch_and_shuffle_data(
         train_pattern_scaling_name=train_pattern_scaling_name,
         ramp_down_corrected_ps=ramp_down_corrected_ps      
     )
-    train_data_input, train_data_output = prepare_all_train_data(train_data_np, n=sample_length)
+    train_data_input, train_data_output = prepare_all_train_data(train_data_np, n=sample_length,n_skip=n_skip)
     train_data_shuffeled = shuffle_train_data(train_data_input, train_data_output, random_state=random_state)
 
     return train_data_shuffeled
