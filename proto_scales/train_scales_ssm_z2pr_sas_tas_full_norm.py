@@ -13,7 +13,7 @@ import pandas as pd
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
 TEST_SCENARIOS = ['ssp245']
-TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp245','ssp534-over','abrupt-4xco2']#'flat10zecincspinoff','flat10cdrincspinoff']#'ssp126'#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt-4xco2','ssp119','ssp460','ssp370']
+TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp245','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff']#'ssp126'#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt-4xco2','ssp119','ssp460','ssp370']
 N = 200
 n_skip = 100
 ML_MODEL = 'feed_forward' 
