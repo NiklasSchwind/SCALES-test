@@ -9,6 +9,7 @@ import numpy as np
 import pickle
 import argparse
 import pandas as pd
+from datetime import datetime
 
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
@@ -38,7 +39,9 @@ if __name__ == "__main__":
     # parser.add_argument("operation", choices=["add", "sub", "mul", "div"],
     #                     help="The operation to perform.")
     # parser.add_argument("x", type=float, help="The first number.")
-    parser.add_argument("cluster", type=str, help="Cluster name ASC or IIASA")
+    parser.add_argument("--cluster", type=str, help="Cluster name ASC or IIASA")
+    parser.add_argument("--add_data", nargs="+", type=str, default=[], help="Additional scenario names to add to training data")                                                                                                                     
+    parser.add_argument("--rm_data", nargs="+", type=str, default=[], help="Scenario names to remove from training data")  
     
     args = parser.parse_args()
 
@@ -47,6 +50,9 @@ if __name__ == "__main__":
         MODEL_PATH = MODEL_PATH_ASC
     else:
         MODEL_PATH = MODEL_PATH_IIASA
+
+    TRAIN_SCENARIOS.extend(args.add_data)
+    TRAIN_SCENARIOS = [s for s in TRAIN_SCENARIOS if s not in args.rm_data]
     
     print("MODEL_PATH", MODEL_PATH)
 
@@ -159,9 +165,12 @@ if __name__ == "__main__":
         traceback.print_exc()
         raise
 
-    os.makedirs("outputs_ssm_scales", exist_ok=True)
-    torch.save(model.state_dict(),"outputs_ssm_scales/model_out")
-    y_scaler.save("outputs_ssm_scales/y_scaler.out")
-    u_scaler.save("outputs_ssm_scales/u_scaler.out")
-    pr_scaler.save("outputs_ssm_scales/pr_scaler.out")
+    run_dir = os.path.join("outputs_ssm_scales", "scales_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "train_scenarios.txt"), "w") as f:
+        f.write("\n".join(TRAIN_SCENARIOS))
+    torch.save(model.state_dict(), os.path.join(run_dir, "model_out"))
+    y_scaler.save(os.path.join(run_dir, "y_scaler.out"))
+    u_scaler.save(os.path.join(run_dir, "u_scaler.out"))
+    pr_scaler.save(os.path.join(run_dir, "pr_scaler.out"))
     
