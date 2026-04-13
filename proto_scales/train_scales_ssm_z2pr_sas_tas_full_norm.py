@@ -23,7 +23,7 @@ RAMP_DOWN_CORRECTED_PS = False
 monthly_flag = True
 use_smoothing = False
 train_pattern_scaling_name = 'ssp585'
-epochs = 300
+epochs = 500
 
 MODEL_PATH_IIASA = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 MODEL_PATH_ASC = f'/gpfs/data/fs73093/kain/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
