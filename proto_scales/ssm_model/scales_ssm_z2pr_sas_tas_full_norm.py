@@ -452,6 +452,7 @@ def run_train(
     epochs=50,
     lr=2e-3,
     z_dim=16,
+    rnn_hidden=62,
 ):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -504,7 +505,7 @@ def run_train(
 
     Dy = y_np.shape[-1]
     Du = u_np.shape[-1]
-    raw_model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim).to(device)
+    raw_model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim,rnn_hidden=rnn_hidden).to(device)
     # Copy into raw_model.ctrl_lin and freeze (recommended for fallback)
     load_into_ctrl_lin(raw_model, W, b, freeze=True)
     ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank} if use_cuda else {}
