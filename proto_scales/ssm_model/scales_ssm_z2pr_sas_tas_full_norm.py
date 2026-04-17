@@ -137,12 +137,13 @@ class DeepSSMPatternConditioned(nn.Module):
     p(z_t | z_{t-1}, u_t) via MLP([z_{t-1},u_t]) -> (mu, logvar)
     p(y_t | z_t) via MLP(z_t) -> (mu_y) with learned global sigma_y
     """
-    def __init__(self, y_dim, u_dim, z_dim=16, rnn_hidden=62, mlp_hidden=128, emission_uses_u=False):
+    def __init__(self, y_dim, u_dim, z_dim=16, rnn_hidden=62, mlp_hidden=128, emission_uses_u=False,use_linear_model=True):
         super().__init__()
         self.y_dim = y_dim
         self.u_dim = u_dim
         self.z_dim = z_dim
         self.emission_uses_u = emission_uses_u
+        self.use_linear_model = use_linear_model
 
         self.gru = nn.GRU(input_size=y_dim + u_dim, hidden_size=rnn_hidden, batch_first=True)
         self.q_head = nn.Linear(rnn_hidden, 2 * z_dim)
@@ -155,7 +156,8 @@ class DeepSSMPatternConditioned(nn.Module):
         self.emit_pr = scales_ssm.MLP(emit_in,4*y_dim,hidden = 230)
 
         #pattern scaling like head for emission
-        self.ctrl_lin = nn.Linear(u_dim, y_dim,bias=True)
+        if(self.use_linear_model):
+            self.ctrl_lin = nn.Linear(u_dim, y_dim,bias=True)
 
         self.eps = 1e-6
         
@@ -190,7 +192,8 @@ class DeepSSMPatternConditioned(nn.Module):
         z_prev = None
         for t in range(T):
             z_t = self.sample(mu_q[:, t], logvar_q[:, t])
-            ctrl = self.ctrl_lin(u[:, t])              # [B, y_dim]
+            if(self.use_linear_model):
+                ctrl = self.ctrl_lin(u[:, t])              # [B, y_dim]
                     
             if self.emission_uses_u:
                 emit_out = self.emit(torch.cat([z_t, u[:, t]], dim=-1))  # [B, 2*y_dim]
@@ -202,7 +205,10 @@ class DeepSSMPatternConditioned(nn.Module):
             res, log_sigma_y_t = torch.chunk(emit_out, 2, dim=-1)
             log_sigma_y_t = torch.clamp(log_sigma_y_t, -8.0, 4.0)
             sigma_y_t = torch.exp(log_sigma_y_t) + self.eps
-            y_hat = ctrl + res
+            if(self.use_linear_model):
+                y_hat = ctrl + res
+            else:
+                y_hat = res
 
             # Gaussian NLL with per-step sigma
             r = (y[:, t] - y_hat) / sigma_y_t
@@ -264,7 +270,8 @@ class DeepSSMPatternConditioned(nn.Module):
                 logvar_p = torch.clamp(logvar_p, -12.0, 6.0)
                 z = self.sample(mu_p, logvar_p)
 
-                ctrl = self.ctrl_lin(u_t)
+                if(self.use_linear_model):
+                    ctrl = self.ctrl_lin(u_t)
 
                 if self.emission_uses_u:
                     emit_out = self.emit(torch.cat([z, u_t], dim=-1))
@@ -276,7 +283,10 @@ class DeepSSMPatternConditioned(nn.Module):
                 res, log_sigma_y_t = torch.chunk(emit_out, 2, dim=-1)
                 log_sigma_y_t = torch.clamp(log_sigma_y_t, -8.0, 4.0)
                 sigma_y_t = torch.exp(log_sigma_y_t) + self.eps
-                y_hat = ctrl + res
+                if(self.use_linear_model):
+                    y_hat = ctrl + res
+                else:
+                    y_hat = res
 
                 out = self.emit_pr(e_in)
                 mu_t, log_sigma_t, eps_skew_t, log_delta_t = torch.chunk(out, 4, dim=-1)
@@ -318,8 +328,8 @@ class DeepSSMPatternConditioned(nn.Module):
                 mu_p, logvar_p = torch.chunk(self.trans(torch.cat([z, u_t], dim=-1)), 2, dim=-1)
                 logvar_p = torch.clamp(logvar_p, -12.0, 6.0)
                 z = self.sample(mu_p, logvar_p)
-
-                ctrl = self.ctrl_lin(u_t)
+                if(self.use_linear_model):
+                    ctrl = self.ctrl_lin(u_t)
                 if self.emission_uses_u:
                     emit_out = self.emit(torch.cat([z, u_t], dim=-1))
                     e_in = torch.cat([z, u_t], dim=-1)
@@ -328,7 +338,10 @@ class DeepSSMPatternConditioned(nn.Module):
                     e_in = z
 
                 res, _ = torch.chunk(emit_out, 2, dim=-1)
-                y_hat = ctrl + res
+                if(self.use_linear_model):
+                    y_hat = ctrl + res
+                else:
+                    y_hat = res
 
                 out = self.emit_pr(e_in)
                 mu_t, log_sigma_t, eps_skew_t, log_delta_t = torch.chunk(out, 4, dim=-1)
@@ -453,6 +466,7 @@ def run_train(
     lr=2e-3,
     z_dim=16,
     rnn_hidden=62,
+    use_linear_model = True,
 ):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -489,8 +503,9 @@ def run_train(
     print("data standardised.")
 
     # Fit ridge on TRAIN only
-    W, b = fit_ridge_D(u_trn, y_trn, alpha=1e-2, fit_intercept=True)
-    print("ridge regression completed")
+    if(use_linear_model):
+        W, b = fit_ridge_D(u_trn, y_trn, alpha=1e-2, fit_intercept=True)
+        print("ridge regression completed")
 
     #mu_control, inv_cov_control = fit_control_mahalanobis(u_trn)
 
@@ -505,9 +520,11 @@ def run_train(
 
     Dy = y_np.shape[-1]
     Du = u_np.shape[-1]
-    raw_model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim,rnn_hidden=rnn_hidden).to(device)
+    raw_model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim,rnn_hidden=rnn_hidden,
+        use_linear_model=use_linear_model).to(device)
     # Copy into raw_model.ctrl_lin and freeze (recommended for fallback)
-    load_into_ctrl_lin(raw_model, W, b, freeze=True)
+    if(use_linear_model):
+        load_into_ctrl_lin(raw_model, W, b, freeze=True)
     ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank} if use_cuda else {}
     model = DDP(raw_model, **ddp_kwargs)
 
@@ -526,13 +543,13 @@ def run_train(
     ctrl_lin_unfrozen = False
 
     for epoch in range(1, epochs + 1):
-
-        if epoch == unfreeze_epoch and not ctrl_lin_unfrozen:
-            for p in raw_model.ctrl_lin.parameters():
-                p.requires_grad = True
-            opt.add_param_group({"params": list(raw_model.ctrl_lin.parameters()), "lr": 2e-4})
-            ctrl_lin_unfrozen = True
-            print(f"Unfreezing ctrl_lin at epoch {epoch}")
+        if(use_linear_model):
+            if epoch == unfreeze_epoch and not ctrl_lin_unfrozen:
+                for p in raw_model.ctrl_lin.parameters():
+                    p.requires_grad = True
+                opt.add_param_group({"params": list(raw_model.ctrl_lin.parameters()), "lr": 2e-4})
+                ctrl_lin_unfrozen = True
+                print(f"Unfreezing ctrl_lin at epoch {epoch}")
 
         model.train()
 
@@ -560,8 +577,9 @@ def run_train(
             mean, _, _ ,mean_pr,_,_= raw_model.forecast_deterministic(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
             roll_out_mse =((mean - y_fut) ** 2).mean()
             roll_out_mse_pr = ((mean_pr - pr_fut) ** 2).mean()
-            lin_mean = raw_model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
-            lin_mse = ((lin_mean-y_full)**2).mean()
+            if(use_linear_model):
+                lin_mean = raw_model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
+                lin_mse = ((lin_mean-y_full)**2).mean()
 
 
             # anneal KL weight
@@ -577,7 +595,10 @@ def run_train(
 
 
             if(global_step%100==0):
-                print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item(),nll_pr.item(),roll_out_mse_pr.item())
+                if(use_linear_model):
+                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item(),nll_pr.item(),roll_out_mse_pr.item())
+                else:
+                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),nll_pr.item(),roll_out_mse_pr.item()) 
 
             opt.zero_grad()
             loss.backward()
