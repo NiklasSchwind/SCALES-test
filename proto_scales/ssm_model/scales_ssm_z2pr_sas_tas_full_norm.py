@@ -581,6 +581,15 @@ def run_train(
                 lin_mean = raw_model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
                 lin_mse = ((lin_mean-y_full)**2).mean()
 
+            # yearly average loss: penalise trend errors over complete 12-month blocks
+            n_complete_years = horizon // 12
+            if n_complete_years > 0:
+                H_yr = n_complete_years * 12
+                mean_yr = mean[:, :H_yr, :].reshape(B, n_complete_years, 12, Dy).mean(dim=2)
+                y_fut_yr = y_fut[:, :H_yr, :].reshape(B, n_complete_years, 12, Dy).mean(dim=2)
+                roll_out_mse_yearly = ((mean_yr - y_fut_yr) ** 2).mean()
+            else:
+                roll_out_mse_yearly = torch.tensor(0.0, device=device)
 
             # anneal KL weight
             global_step += 1
@@ -589,16 +598,17 @@ def run_train(
             kl_w = 5
             alpha = 10000
             omega = 100
+            gamma = 50000  # yearly trend loss weight
 
 
-            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr
+            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly
 
 
             if(global_step%100==0):
                 if(use_linear_model):
-                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item(),nll_pr.item(),roll_out_mse_pr.item())
+                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item(),nll_pr.item(),roll_out_mse_pr.item(),roll_out_mse_yearly.item())
                 else:
-                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),nll_pr.item(),roll_out_mse_pr.item()) 
+                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),nll_pr.item(),roll_out_mse_pr.item(),roll_out_mse_yearly.item())
 
             opt.zero_grad()
             loss.backward()
