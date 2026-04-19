@@ -15,8 +15,8 @@ MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
 TEST_SCENARIOS = ['ssp245']
 TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp245','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff']#'ssp126'#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt-4xco2','ssp119','ssp460','ssp370']
-N = 300
-n_skip = 150
+N = 600
+n_skip = 200
 ML_MODEL = 'feed_forward' 
 PATTERN_SCALING_RESIDUALS = False
 RAMP_DOWN_CORRECTED_PS = False
@@ -160,7 +160,7 @@ if __name__ == "__main__":
     device = "cuda"
 
     try:
-        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=64,rnn_hidden=256,horizon=200, 
+        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=300, z_dim=64,rnn_hidden=256,horizon=300, 
             use_linear_model=use_linear_model,epochs=epochs,batch_size=250)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
