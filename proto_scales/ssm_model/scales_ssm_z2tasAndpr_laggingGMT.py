@@ -561,13 +561,13 @@ def run_train(
     ctrl_lin_unfrozen = False
 
     for epoch in range(1, epochs + 1):
-        if(use_linear_model):
-            if epoch == unfreeze_epoch and not ctrl_lin_unfrozen:
-                for p in raw_model.ctrl_lin.parameters():
-                    p.requires_grad = True
-                opt.add_param_group({"params": list(raw_model.ctrl_lin.parameters()), "lr": 2e-4})
-                ctrl_lin_unfrozen = True
-                print(f"Unfreezing ctrl_lin at epoch {epoch}")
+        # if(use_linear_model):
+        #     if epoch == unfreeze_epoch and not ctrl_lin_unfrozen:
+        #         for p in raw_model.ctrl_lin.parameters():
+        #             p.requires_grad = True
+        #         opt.add_param_group({"params": list(raw_model.ctrl_lin.parameters()), "lr": 2e-4})
+        #         ctrl_lin_unfrozen = True
+        #         print(f"Unfreezing ctrl_lin at epoch {epoch}")
 
         model.train()
 
