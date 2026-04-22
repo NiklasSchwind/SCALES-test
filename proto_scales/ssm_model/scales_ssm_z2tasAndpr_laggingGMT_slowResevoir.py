@@ -518,8 +518,8 @@ def run_train(
     z_dim=16,
     rnn_hidden=62,
     use_linear_model = True,
-    resevoir_dim = 2,
-    alpha_max = 0.02,
+    resevoir_dim = 3,
+    alpha_max = 0.1,
 ):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
