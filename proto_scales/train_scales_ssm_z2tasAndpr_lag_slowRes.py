@@ -41,9 +41,10 @@ if __name__ == "__main__":
     #                     help="The operation to perform.")
     # parser.add_argument("x", type=float, help="The first number.")
     parser.add_argument("--cluster", type=str, help="Cluster name ASC or IIASA")
-    parser.add_argument("--add_data", nargs="+", type=str, default=[], help="Additional scenario names to add to training data")                                                                                                                     
-    parser.add_argument("--rm_data", nargs="+", type=str, default=[], help="Scenario names to remove from training data")  
-    
+    parser.add_argument("--add_data", nargs="+", type=str, default=[], help="Additional scenario names to add to training data")
+    parser.add_argument("--rm_data", nargs="+", type=str, default=[], help="Scenario names to remove from training data")
+    parser.add_argument("--reservoir", type=int, default=2, help="reservoir_dim for the slow reservoir")
+
     args = parser.parse_args()
 
    
@@ -160,8 +161,8 @@ if __name__ == "__main__":
     device = "cuda"
 
     try:
-        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=32,rnn_hidden=64,horizon=100, 
-            use_linear_model=use_linear_model,epochs=epochs,batch_size=250)
+        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=32,rnn_hidden=64,horizon=100,
+            use_linear_model=use_linear_model,epochs=epochs,batch_size=250,reservoir_dim=args.reservoir)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()
@@ -171,6 +172,8 @@ if __name__ == "__main__":
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "train_scenarios.txt"), "w") as f:
         f.write("\n".join(TRAIN_SCENARIOS))
+    with open(os.path.join(run_dir, "config.txt"), "w") as f:
+        f.write(f"reservoir_dim={args.reservoir}\n")
     torch.save(model.state_dict(), os.path.join(run_dir, "model_out"))
     y_scaler.save(os.path.join(run_dir, "y_scaler.out"))
     u_scaler.save(os.path.join(run_dir, "u_scaler.out"))
