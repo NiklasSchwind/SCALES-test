@@ -162,7 +162,7 @@ if __name__ == "__main__":
 
     try:
         model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=64,rnn_hidden=256,horizon=100,
-            use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=0.05, resevoir_dim=args.reservoir)
+            use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=0.08, resevoir_dim=args.reservoir)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()
