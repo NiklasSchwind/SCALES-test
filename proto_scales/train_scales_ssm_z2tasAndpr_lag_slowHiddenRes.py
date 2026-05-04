@@ -160,20 +160,21 @@ if __name__ == "__main__":
   
     device = "cuda"
 
-    try:
-        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=64,rnn_hidden=256,horizon=500,
-            use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=0.02, resevoir_dim=args.reservoir)
-    except Exception:
-        print(f"[Rank {_local_rank}] run_train failed:", flush=True)
-        traceback.print_exc()
-        raise
-
     run_dir = os.path.join("outputs_ssm_scales", "scales_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "train_scenarios.txt"), "w") as f:
         f.write("\n".join(TRAIN_SCENARIOS))
     with open(os.path.join(run_dir, "config.txt"), "w") as f:
         f.write(f"reservoir_dim={args.reservoir}\n")
+
+    try:
+        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=64,rnn_hidden=256,horizon=500,
+            use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=0.02, resevoir_dim=args.reservoir,
+            run_dir=run_dir)
+    except Exception:
+        print(f"[Rank {_local_rank}] run_train failed:", flush=True)
+        traceback.print_exc()
+        raise
     torch.save(model.state_dict(), os.path.join(run_dir, "model_out"))
     y_scaler.save(os.path.join(run_dir, "y_scaler.out"))
     u_scaler.save(os.path.join(run_dir, "u_scaler.out"))

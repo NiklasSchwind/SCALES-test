@@ -520,6 +520,7 @@ def run_train(
     use_linear_model = True,
     resevoir_dim = 2,
     alpha_max = 0.02,
+    run_dir = None,
 ):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -706,8 +707,10 @@ def run_train(
         va = float(np.mean(va_loss))
         mse = float(np.mean(va_mse))
         print(f"epoch {epoch:03d} | train {tr:.4f} | val_elbo {va:.4f} | val_mse {mse:.4f}")
-        os.makedirs("outputs_ssm_scales", exist_ok=True)
-        torch.save(raw_model.state_dict(),"outputs_ssm_scales/model_out")
+        if run_dir is not None and epoch % 10 == 0:
+            ckpt_dir = os.path.join(run_dir, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(raw_model.state_dict(), os.path.join(ckpt_dir, f"model_epoch{epoch:04d}.pt"))
 
         # early stopping on val_elbo
         if va < best_val - 1e-4:
