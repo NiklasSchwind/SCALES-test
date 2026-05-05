@@ -215,7 +215,8 @@ class DeepSSMPatternConditioned(nn.Module):
 
         if self.emission_uses_u:
             uh, _ = self.u_gru(u)  # [B, T, u_rnn_hidden]
-            s = torch.zeros(B, self.y_dim, self.reservoir_dim, device=y.device)
+            # initialise s at analytical equilibrium given first u step
+            s = self.omega_lin(uh[:, 0]).reshape(B, self.y_dim, self.reservoir_dim).detach()
 
         z_prev = None
         for t in range(T):
