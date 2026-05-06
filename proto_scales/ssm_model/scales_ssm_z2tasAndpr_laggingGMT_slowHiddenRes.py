@@ -522,6 +522,7 @@ def run_train(
     resevoir_dim = 2,
     alpha_max = 0.02,
     run_dir = None,
+    weights_file = None,
 ):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -548,6 +549,10 @@ def run_train(
     u_scaler = scales_ssm.StandardScaler().fit(u_tr)
     pr_scaler = scales_ssm.StandardScaler().fit(pr_tr)
     print("Created standard scaler")
+    if run_dir is not None:
+        y_scaler.save(os.path.join(run_dir, "y_scaler.out"))
+        u_scaler.save(os.path.join(run_dir, "u_scaler.out"))
+        pr_scaler.save(os.path.join(run_dir, "pr_scaler.out"))
     y_trn = y_scaler.transform(y_tr)
     pr_trn = pr_scaler.transform(pr_tr)
     y_van = y_scaler.transform(y_va)
@@ -578,6 +583,9 @@ def run_train(
     raw_model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=z_dim,rnn_hidden=rnn_hidden,
         use_linear_model=use_linear_model,emission_uses_u=True,reservoir_dim=resevoir_dim,
         alpha_max=alpha_max).to(device)
+    if weights_file is not None:
+        raw_model.load_state_dict(torch.load(weights_file, map_location=device))
+        print(f"Loaded weights from {weights_file}")
     # Copy into raw_model.ctrl_lin and freeze (recommended for fallback)
     if(use_linear_model):
         load_into_ctrl_lin(raw_model, W, b, freeze=True)

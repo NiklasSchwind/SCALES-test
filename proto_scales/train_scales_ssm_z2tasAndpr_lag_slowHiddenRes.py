@@ -44,6 +44,7 @@ if __name__ == "__main__":
     parser.add_argument("--add_data", nargs="+", type=str, default=[], help="Additional scenario names to add to training data")
     parser.add_argument("--rm_data", nargs="+", type=str, default=[], help="Scenario names to remove from training data")
     parser.add_argument("--reservoir", type=int, default=2, help="reservoir_dim for the slow reservoir")
+    parser.add_argument("--weights_file", type=str, default=None, help="Path to existing model weights file to initialise training from")
 
     args = parser.parse_args()
 
@@ -170,7 +171,7 @@ if __name__ == "__main__":
     try:
         model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=64,rnn_hidden=256,horizon=500,
             use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=0.02, resevoir_dim=args.reservoir,
-            run_dir=run_dir)
+            run_dir=run_dir, weights_file=args.weights_file)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()
