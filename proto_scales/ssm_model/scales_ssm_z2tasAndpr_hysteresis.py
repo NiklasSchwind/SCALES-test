@@ -661,7 +661,7 @@ def run_train(
             kl_w = frac  # 0->1
             kl_w = 5
             alpha = 10000
-            omega = 5000
+            omega = 500
             gamma = 80000  # yearly trend loss weight
 
 
