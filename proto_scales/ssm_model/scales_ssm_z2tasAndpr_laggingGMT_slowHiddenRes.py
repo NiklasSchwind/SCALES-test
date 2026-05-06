@@ -661,12 +661,12 @@ def run_train(
             kl_w = frac  # 0->1
             kl_w = 5
             alpha = 10000
-            omega = 100
+            omega = 5000
             gamma = 80000  # yearly trend loss weight
 
 
-            #loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly
-            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + gamma*roll_out_mse_yearly
+            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly
+            #loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + gamma*roll_out_mse_yearly
 
 
             if(global_step%100==0):
