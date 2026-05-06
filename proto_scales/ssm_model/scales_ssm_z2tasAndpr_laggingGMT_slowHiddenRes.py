@@ -665,7 +665,8 @@ def run_train(
             gamma = 80000  # yearly trend loss weight
 
 
-            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly
+            #loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly
+            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + gamma*roll_out_mse_yearly
 
 
             if(global_step%100==0):
