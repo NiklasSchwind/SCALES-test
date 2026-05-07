@@ -163,7 +163,7 @@ class DeepSSMPatternConditioned(nn.Module):
             # omega_lin projects uh_t [B, u_rnn_hidden] -> target [B, y_dim * reservoir_dim]
             self.omega_lin = nn.Linear(u_rnn_hidden, y_dim * reservoir_dim, bias=False)
 
-        emit_in = z_dim + (y_dim * reservoir_dim if emission_uses_u else 0)
+        emit_in = z_dim + (u_rnn_hidden + y_dim * reservoir_dim if emission_uses_u else 0)
         self.emit = scales_ssm.MLP(emit_in, 2 * y_dim, hidden=mlp_hidden)
 
         self.emit_pr = scales_ssm.MLP(emit_in,4*y_dim,hidden = 230)
@@ -225,7 +225,7 @@ class DeepSSMPatternConditioned(nn.Module):
                 ctrl = self.ctrl_lin(u[:, t])              # [B, y_dim]
 
             if self.emission_uses_u:
-                e_in = torch.cat([z_t, s.reshape(B, -1)], dim=-1)
+                e_in = torch.cat([z_t, uh[:, t], s.reshape(B, -1)], dim=-1)
             else:
                 e_in = z_t
 
@@ -315,7 +315,7 @@ class DeepSSMPatternConditioned(nn.Module):
                 if self.emission_uses_u:
                     uh_t, h_u_s = self.u_gru(u_t.unsqueeze(1), h_u_s)
                     uh_t = uh_t.squeeze(1)  # [B, u_rnn_hidden]
-                    e_in = torch.cat([z, s.reshape(B, -1)], dim=-1)
+                    e_in = torch.cat([z, uh_t, s.reshape(B, -1)], dim=-1)
                     s = self._reservoir_step(s, uh_t)
                 else:
                     e_in = z
@@ -383,7 +383,7 @@ class DeepSSMPatternConditioned(nn.Module):
                 if self.emission_uses_u:
                     uh_t, h_u_s = self.u_gru(u_t.unsqueeze(1), h_u_s)
                     uh_t = uh_t.squeeze(1)  # [B, u_rnn_hidden]
-                    e_in = torch.cat([z, s.reshape(B, -1)], dim=-1)
+                    e_in = torch.cat([z, uh_t, s.reshape(B, -1)], dim=-1)
                     s = self._reservoir_step(s, uh_t)
                 else:
                     e_in = z
@@ -639,8 +639,8 @@ def run_train(
 
             nll, kl, nll_pr = raw_model.forward_elbo(y_full, pr_full, u_full, kl_free_bits=0.2)
             mean, _, _ ,mean_pr,_,_= raw_model.forecast_deterministic(y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
-            roll_out_mse =((mean - y_fut) ** 2).mean()
-            roll_out_mse_pr = ((mean_pr - pr_fut) ** 2).mean()
+            roll_out_mse = F.huber_loss(mean, y_fut, delta=1.0)
+            roll_out_mse_pr = F.huber_loss(mean_pr, pr_fut, delta=1.0)
             if(use_linear_model):
                 lin_mean = raw_model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
                 lin_mse = ((lin_mean-y_full)**2).mean()
@@ -655,14 +655,13 @@ def run_train(
             else:
                 roll_out_mse_yearly = torch.tensor(0.0, device=device)
 
-            # anneal KL weight
+            # anneal KL weight and rollout weights
             global_step += 1
             frac = min(1.0, global_step / int(0.3 * total_steps))
-            kl_w = frac  # 0->1
             kl_w = 5
-            alpha = 10000
-            omega = 500
-            gamma = 80000  # yearly trend loss weight
+            alpha = 10000 * frac
+            omega = 500   * frac
+            gamma = 80000  # yearly trend loss weight — no warmup
 
 
             loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly
