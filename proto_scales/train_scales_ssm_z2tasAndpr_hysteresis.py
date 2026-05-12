@@ -44,6 +44,7 @@ if __name__ == "__main__":
     parser.add_argument("--add_data", nargs="+", type=str, default=[], help="Additional scenario names to add to training data")
     parser.add_argument("--rm_data", nargs="+", type=str, default=[], help="Scenario names to remove from training data")
     parser.add_argument("--reservoir", type=int, default=2, help="reservoir_dim for the slow reservoir")
+    parser.add_argument("--alpha_max", type=float, default=0.02, help="Maximum alpha for slow reservoir (controls minimum time constant)")
     parser.add_argument("--weights_file", type=str, default=None, help="Path to existing model weights file to initialise training from")
 
     args = parser.parse_args()
@@ -167,10 +168,11 @@ if __name__ == "__main__":
         f.write("\n".join(TRAIN_SCENARIOS))
     with open(os.path.join(run_dir, "config.txt"), "w") as f:
         f.write(f"reservoir_dim={args.reservoir}\n")
+        f.write(f"alpha_max={args.alpha_max}\n")
 
     try:
         model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=64,rnn_hidden=256,horizon=500,
-            use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=0.02, resevoir_dim=args.reservoir,
+            use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=args.alpha_max, resevoir_dim=args.reservoir,
             run_dir=run_dir, weights_file=args.weights_file)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
