@@ -171,7 +171,7 @@ if __name__ == "__main__":
         f.write(f"alpha_max={args.alpha_max}\n")
 
     try:
-        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=100, z_dim=64,rnn_hidden=256,horizon=500,
+        model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=600, z_dim=64,rnn_hidden=256,horizon=1200,
             use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=args.alpha_max, resevoir_dim=args.reservoir,
             run_dir=run_dir, weights_file=args.weights_file)
     except Exception:
