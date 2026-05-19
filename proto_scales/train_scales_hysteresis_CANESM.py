@@ -23,7 +23,7 @@ RAMP_DOWN_CORRECTED_PS = False
 monthly_flag = True
 use_smoothing = False
 train_pattern_scaling_name = 'ssp585'
-epochs = 500
+epochs = 10
 use_linear_model = True
 
 MODEL_PATH_IIASA = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
