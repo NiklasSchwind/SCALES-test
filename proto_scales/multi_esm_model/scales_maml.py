@@ -497,6 +497,7 @@ if __name__ == "__main__":
         esm_data[model] = task_data
     
     tasks,scalers = build_task_dict(esm_data=esm_data,context_len=600,horizon=1200)
+    print(tasks.keys())
 
     
         
