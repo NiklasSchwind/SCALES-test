@@ -270,7 +270,8 @@ def inner_loop(
         lr=alpha,
     )
 
-    loader    = DataLoader(task['support'], batch_size=batch_size, shuffle=True, drop_last=True)
+    s_bs      = min(batch_size, len(task['support']))
+    loader    = DataLoader(task['support'], batch_size=s_bs, shuffle=True, drop_last=False)
     data_iter = iter(loader)
 
     for _ in range(num_steps):
