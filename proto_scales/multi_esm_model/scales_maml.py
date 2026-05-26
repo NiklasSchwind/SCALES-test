@@ -472,6 +472,7 @@ if __name__ == "__main__":
     monthly_flag = True
     use_smoothing = False
     train_pattern_scaling_name = 'ssp585'
+    weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260514_171221/model_out"
 
     run_dir = os.path.join("outputs_ssm_scales", "scales_maml_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
@@ -498,8 +499,32 @@ if __name__ == "__main__":
         task_data['weight'] = weights[i]
         esm_data[model] = task_data
     
-    tasks,scalers = build_task_dict(esm_data=esm_data,context_len=600,horizon=1200)
-    print(tasks.keys())
+    Dy = tas.shape[-1]
+    Du = u.shape[-1]
+    
+    tasks,scalers = build_task_dict(esm_data=esm_data,context_len=600,horizon=1200,run_dir=run_dir)
+
+    zdim = 64
+    rnn_hidden=256
+    use_linear_model = True
+    emission_uses_u =True
+    alpha_max = 0.002
+    resevoir_dim = 4
+
+    device = "cuda"
+
+    model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=zdim,rnn_hidden=rnn_hidden,use_linear_model=use_linear_model,
+                                 emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max).to(device)
+
+    
+    model.load_state_dict(torch.load(weights_file, map_location=device))
+    print(f"Loaded weights from {weights_file}")
+
+    train_meta(model=model,task_dict=tasks,num_epochs=10,num_inner_steps=1,alpha=1e-3,beta=1e-4,run_dir=run_dir,
+        batch_size=250,device = device)
+
+
+    
 
     
         
