@@ -3,6 +3,7 @@ import logging
 import numpy as np
 import sys
 import os
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from proto_scales.ssm_model.scales_ssm_z2tasAndpr_hysteresis import (
     DeepSSMPatternConditioned,
 )
 from proto_scales.ssm_model.scales_ssm import StandardScaler
+import proto_scales.data_prep.prepare_data as prep
 
 
 
@@ -483,7 +485,7 @@ if __name__ == "__main__":
         task_data = {}
         model_path = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{model}'
 
-        u,tas,pr=prepare_ds_data(
+        u,tas,pr=prep.prepare_ds_data(
             model_path = model_path,
             train_scenarios=TRAIN_SCENARIOS,
             indicators=INDICATORS,
