@@ -14,6 +14,7 @@ from proto_scales.ssm_model.scales_ssm_z2tasAndpr_hysteresis import (
     UnifiedWindowDataset,
     DeepSSMPatternConditioned,
 )
+from proto_scales.ssm_model.scales_ssm import StandardScaler
 
 
 
@@ -30,9 +31,14 @@ def build_task_dict(
     stride=1,
     support_frac=0.7,
     start_mode="all",
+    run_dir=None,
 ):
     """
-    Build a MAML task dictionary from multi-ESM data.
+    Build a MAML task dictionary from multi-ESM data, with global cross-ESM scalers.
+
+    Scalers are fitted on the pooled support data from all ESMs so that every ESM
+    is normalised consistently.  Fitting only on support (not query) data follows
+    the same convention as run_train in scales_ssm_z2tasAndpr_hysteresis.py.
 
     Parameters
     ----------
@@ -53,27 +59,33 @@ def build_task_dict(
         Remaining scenarios form the query set.
     start_mode : str
         Window sampling mode passed to UnifiedWindowDataset ("all" or "zero").
+    run_dir : str or None
+        If provided, the three global scalers are saved here as
+        y_scaler.out / pr_scaler.out / u_scaler.out.
 
     Returns
     -------
     tasks : dict
         {
           esm_name: {
-            'support' : UnifiedWindowDataset,
-            'query'   : UnifiedWindowDataset,
+            'support' : UnifiedWindowDataset,  (normalised)
+            'query'   : UnifiedWindowDataset,  (normalised)
             'weight'  : float,
           },
           ...
         }
+    scalers : dict
+        {'y': StandardScaler, 'pr': StandardScaler, 'u': StandardScaler}
+        Global scalers fitted on the pooled support data.
     """
-    tasks = {}
+    # ---- Pass 1: validate shapes and compute support/query splits ----
+    raw = {}
     for esm_name, data in esm_data.items():
         y      = np.asarray(data['y'],  dtype=np.float32)
         pr     = np.asarray(data['pr'], dtype=np.float32)
         u      = np.asarray(data['u'],  dtype=np.float32)
         weight = float(data.get('weight', 1.0))
 
-        # Ensure shape is [N, T, D]
         if y.ndim == 2:
             y  = y[None]
             pr = pr[None]
@@ -89,19 +101,45 @@ def build_task_dict(
                 f"support_frac={support_frac} leaves no scenarios for the query set."
             )
 
+        raw[esm_name] = {
+            'y': y, 'pr': pr, 'u': u,
+            'weight': weight, 'n_support': n_support,
+        }
+
+    # ---- Fit global scalers on pooled support data from all ESMs ----
+    # Using only support (not query) data mirrors the train-only convention in run_train.
+    all_y_sup  = np.concatenate([v['y'][:v['n_support']] for v in raw.values()], axis=0)
+    all_pr_sup = np.concatenate([v['pr'][:v['n_support']] for v in raw.values()], axis=0)
+    all_u_sup  = np.concatenate([v['u'][:v['n_support']] for v in raw.values()], axis=0)
+
+    y_scaler  = StandardScaler().fit(all_y_sup)
+    pr_scaler = StandardScaler().fit(all_pr_sup)
+    u_scaler  = StandardScaler().fit(all_u_sup)
+
+    if run_dir is not None:
+        os.makedirs(run_dir, exist_ok=True)
+        y_scaler.save(os.path.join(run_dir,  "y_scaler.out"))
+        pr_scaler.save(os.path.join(run_dir, "pr_scaler.out"))
+        u_scaler.save(os.path.join(run_dir,  "u_scaler.out"))
+
+    # ---- Pass 2: normalise and build UnifiedWindowDatasets ----
+    tasks = {}
+    for esm_name, d in raw.items():
+        n_sup = d['n_support']
+
+        y_n  = y_scaler.transform(d['y'])
+        pr_n = pr_scaler.transform(d['pr'])
+        u_n  = u_scaler.transform(d['u'])
+
         support_ds = UnifiedWindowDataset(
-            y[:n_support],
-            pr[:n_support],
-            u[:n_support],
+            y_n[:n_sup], pr_n[:n_sup], u_n[:n_sup],
             context_len=context_len,
             horizon=horizon,
             stride=stride,
             start_mode=start_mode,
         )
         query_ds = UnifiedWindowDataset(
-            y[n_support:],
-            pr[n_support:],
-            u[n_support:],
+            y_n[n_sup:], pr_n[n_sup:], u_n[n_sup:],
             context_len=context_len,
             horizon=horizon,
             stride=stride,
@@ -111,10 +149,11 @@ def build_task_dict(
         tasks[esm_name] = {
             'support': support_ds,
             'query':   query_ds,
-            'weight':  weight,
+            'weight':  d['weight'],
         }
 
-    return tasks
+    scalers = {'y': y_scaler, 'pr': pr_scaler, 'u': u_scaler}
+    return tasks, scalers
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +367,11 @@ def train_meta(
         # Snapshot current meta-parameters for inner-loop initialisation
         w_meta = {name: p.detach().clone() for name, p in model.named_parameters()}
 
-        meta_loss_total  = torch.tensor(0.0, device=device)
+        meta_loss_val    = 0.0
         per_task_details = {}   # {esm_name: (loss, nll, nll_pr, kl, mse_tas, mse_pr, mse_yr)}
 
         # ---- Per-task inner loop + query evaluation ----
+        meta_opt.zero_grad()
         for esm_name, task in task_dict.items():
             weight = task.get('weight', 1.0)
 
@@ -350,8 +390,9 @@ def train_meta(
                         p.copy_(w_task[name])
             query_model.train()
 
+            q_bs = min(batch_size, len(task['query']))
             query_loader = DataLoader(
-                task['query'], batch_size=batch_size, shuffle=True, drop_last=True
+                task['query'], batch_size=q_bs, shuffle=True, drop_last=False
             )
             query_batch = next(iter(query_loader))
 
@@ -363,15 +404,23 @@ def train_meta(
             per_task_details[esm_name] = (
                 loss_query.item(), nll, nll_pr, kl, mse_tas, mse_pr, mse_yr
             )
-            meta_loss_total = meta_loss_total + weight * loss_query
+            meta_loss_val += weight * loss_query.item()
+
+            # Bug 1 fix (FOMAML): backprop through query_model and accumulate
+            # gradients into the meta-model manually. query_model parameters are
+            # detached from model, so there is no automatic gradient path —
+            # the FOMAML approximation treats the inner-loop Jacobian as identity.
+            (weight * loss_query).backward()
+            for meta_p, qry_p in zip(model.parameters(), query_model.parameters()):
+                if meta_p.requires_grad and qry_p.grad is not None:
+                    if meta_p.grad is None:
+                        meta_p.grad = qry_p.grad.clone()
+                    else:
+                        meta_p.grad += qry_p.grad
 
         # ---- Outer gradient step ----
-        meta_opt.zero_grad()
-        meta_loss_total.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         meta_opt.step()
-
-        meta_loss_val = meta_loss_total.item()
 
         # ---- Logging ----
         if epoch % log_every == 0:
@@ -406,6 +455,51 @@ def train_meta(
         logger.info(f"Restored best meta-model (loss={best_meta_loss:.4f})")
 
     return model
+
+
+
+if __name__ == "__main__":
+
+    models = ['CanESM5','ACCESS-ESM1-5']
+    weights = [1.,1.]
+    INDICATORS = ['tas','pr']
+    TRAIN_SCENARIOS = [ 'ssp585','1pctco2']#,'ssp534-over','flat10cdrincspinoff','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
+    N = 200 
+    PATTERN_SCALING_RESIDUALS = False
+    RAMP_DOWN_CORRECTED_PS = False
+    monthly_flag = True
+    use_smoothing = False
+    train_pattern_scaling_name = 'ssp585'
+
+    run_dir = os.path.join("outputs_ssm_scales", "scales_maml_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "train_scenarios.txt"), "w") as f:
+        f.write("\n".join(TRAIN_SCENARIOS))
+    
+
+    esm_data = {}
+
+    for i,model in enumerate(models):
+        task_data = {}
+        model_path = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{model}'
+
+        u,tas,pr=prepare_ds_data(
+            model_path = model_path,
+            train_scenarios=TRAIN_SCENARIOS,
+            indicators=INDICATORS,
+            sample_length=1800,
+            n_skip=450,
+            )
+        task_data['y'] = tas
+        task_data['pr'] = pr
+        task_data['u'] = u
+        task_data['weight'] = weights[i]
+        esm_data[model] = task_data
+    
+    tasks,scalers = build_task_dict(esm_data=esm_data,context_len=600,horizon=1200)
+
+    
+        
 
 
 

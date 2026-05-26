@@ -966,3 +966,42 @@ def fetch_and_shuffle_data(
     return train_data_shuffeled
 
 
+def prepare_ds_data(
+    model_path:str,
+    train_scenarios:List[str],
+    indicators:List[str],
+    pattern_scaling_residuals:bool=False,
+    ramp_down_corrected_ps:bool=False,
+    use_smoothing:bool=False,
+    monthly_flag:bool=True,
+    sample_length:int=200,
+    random_state=42,
+    n_skip:int=1,
+
+    ):
+    fake_pattern_scaling_name = train_scenarios[0]
+
+    train_data_shuffled = fetch_and_shuffle_data(
+        model_path= model_path,
+        train_scenarios=train_scenarios,
+        indicators=indicators,
+        use_smoothing=use_smoothing,
+        monthly_flag=monthly_flag,
+        pattern_scaling_residuals=pattern_scaling_residuals,
+        train_pattern_scaling_name=fake_pattern_scaling_name,
+        ramp_down_corrected_ps=ramp_down_corrected_ps,
+        sample_length=sample_length,
+        random_state=random_state,
+        n_skip=n_skip,
+        )
+    u = train_data_shuffled[0][0,:].T[..., None]
+    y = np.transpose(train_data_shuffled[0][:,:],(2, 1, 0))
+    y = y[:,:,1:]
+
+    regions = int(y.shape[-1]/2)
+    tas = y[:,:,:regions]
+    pr = y[:,:,-regions:]
+
+    return u,tas,pr
+
+
