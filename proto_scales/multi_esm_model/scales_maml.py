@@ -249,11 +249,12 @@ def inner_loop(
 
     Returns
     -------
-    w_task : dict {param_name: tensor}
-        Adapted parameters after num_steps gradient steps on the support set.
+    task_model : DeepSSMPatternConditioned
+        Deep copy of model with parameters adapted to the task's support set,
+        left in train() mode.
 
-    Note: implements first-order MAML (FOMAML). The returned w_task tensors are
-    detached from the meta-gradient graph. For second-order MAML, replace the
+    Note: implements first-order MAML (FOMAML). The returned task_model parameters
+    are detached from the meta-gradient graph. For second-order MAML, replace the
     deep-copy/SGD approach with torch.func.functional_call and create_graph=True
     through the update steps.
     """
@@ -290,7 +291,7 @@ def inner_loop(
         nn.utils.clip_grad_norm_(task_model.parameters(), 1.0)
         inner_opt.step()
 
-    return {name: p.detach().clone() for name, p in task_model.named_parameters()}
+    return task_model
 
 
 # ---------------------------------------------------------------------------
@@ -379,19 +380,11 @@ def train_meta(
             weight = task.get('weight', 1.0)
 
             # Adapt to support set
-            w_task = inner_loop(
+            query_model = inner_loop(
                 w_meta, model, task, alpha, num_inner_steps, device,
                 batch_size=batch_size,
                 kl_w=kl_w, alpha_w=alpha_w, omega_w=omega_w, gamma_w=gamma_w,
             )
-
-            # Build adapted query model
-            query_model = copy.deepcopy(model).to(device)
-            with torch.no_grad():
-                for name, p in query_model.named_parameters():
-                    if name in w_task:
-                        p.copy_(w_task[name])
-            query_model.train()
 
             q_bs = min(batch_size, len(task['query']))
             query_loader = DataLoader(
