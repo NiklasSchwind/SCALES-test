@@ -481,8 +481,8 @@ if __name__ == "__main__":
     faulthandler.enable()
     _local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    models = ['CanESM5','ACCESS-ESM1-5','IPSL-CM6A-LR','MPI-ESM1-2-LR','MIROC6']
-    weights = [1.,1.,1.,1.,1.]
+    models = ['CanESM5','ACCESS-ESM1-5','MPI-ESM1-2-LR','MIROC6'] #'IPSL-CM6A-LR',
+    weights = [1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
     TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
     N = 200 
