@@ -540,7 +540,7 @@ if __name__ == "__main__":
     print(f"Loaded weights from {weights_file}")
 
     try:
-        model = train_meta(model=model,task_dict=tasks,num_epochs=100,num_inner_steps=3,alpha=1e-3,beta=1e-4,run_dir=run_dir,
+        model = train_meta(raw_model=model,task_dict=tasks,num_epochs=100,num_inner_steps=3,alpha=1e-3,beta=1e-4,run_dir=run_dir,
             batch_size=250,device = device)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
