@@ -617,13 +617,18 @@ def train_cnp(
     run_dir=None,
     device="cuda",
     patience=15,
+    weights_file=None,
 ):
     """
     Train a DeepCnpSsmforESM model on a task dictionary.
 
     task_dict : {esm_name: {'support': UnifiedWindowDataset, 'query': UnifiedWindowDataset, 'weight': float}}
         support  → training set,  query → validation set  (already normalised by build_task_dict)
-    horizon   : forecast horizon in time steps (must match the datasets)
+    horizon      : forecast horizon in time steps (must match the datasets)
+    weights_file : path to a pretrained DeepSSMPatternConditioned state dict.
+        If provided, those weights are loaded into model.ssm and all SSM sub-modules
+        are frozen except the emission heads (emit, emit_pr).  The CNP modules
+        (ctx_encoder, lat_encoder, z_cnp_proj) are always trainable.
 
     Loss (mirrors run_train):
         nll + nll_pr + kl_w*kl_ssm + kl_cnp_w*kl_cnp
@@ -632,7 +637,16 @@ def train_cnp(
     The warm-up part of each batch (y_ctx, u_ctx, pr_ctx) is reused as the CNP context set.
     """
     model = model.to(device)
-    opt   = torch.optim.AdamW(
+
+    if weights_file is not None:
+        model.ssm.load_state_dict(torch.load(weights_file, map_location=device))
+        print(f"Loaded SSM weights from {weights_file}")
+        # Freeze all SSM parameters except the emission heads
+        for name, p in model.ssm.named_parameters():
+            p.requires_grad = name.startswith("emit")
+        print("SSM frozen except emit and emit_pr; CNP modules trainable.")
+
+    opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=lr
     )
 
@@ -808,7 +822,7 @@ if __name__ == "__main__":
     monthly_flag = True
     use_smoothing = False
     train_pattern_scaling_name = 'ssp585'
-    weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260514_171221/model_out"
+    maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260526_135511/checkpoints/meta_epoch0010.pt"
 
     run_dir = os.path.join("outputs_ssm_scales", "scales_maml_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
@@ -849,15 +863,14 @@ if __name__ == "__main__":
 
     device = "cuda"
 
-    model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=zdim,rnn_hidden=rnn_hidden,use_linear_model=use_linear_model,
+    model_ssm = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=zdim,rnn_hidden=rnn_hidden,use_linear_model=use_linear_model,
                                  emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max).to(device)
 
-    
-    model.load_state_dict(torch.load(weights_file, map_location=device))
-    print(f"Loaded weights from {weights_file}")
+    model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)    
 
-    # train_meta(model=model,task_dict=tasks,num_epochs=10,num_inner_steps=1,alpha=1e-3,beta=1e-4,run_dir=run_dir,
-    #     batch_size=250,device = device)
+    model = train_cnp(model=model,task_dict=tasks,num_epochs=10,horizon=1200,run_dir=run_dir)
+
+    
 
 
     

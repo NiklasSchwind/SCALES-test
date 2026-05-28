@@ -5,9 +5,13 @@ import sys
 import os
 from datetime import datetime
 
+import traceback
+import faulthandler
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -17,6 +21,8 @@ from proto_scales.ssm_model.scales_ssm_z2tasAndpr_hysteresis import (
 )
 from proto_scales.ssm_model.scales_ssm import StandardScaler
 import proto_scales.data_prep.prepare_data as prep
+
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 
@@ -299,7 +305,7 @@ def inner_loop(
 # ---------------------------------------------------------------------------
 
 def train_meta(
-    model,
+    raw_model,
     task_dict,
     num_epochs,
     alpha,
@@ -320,7 +326,7 @@ def train_meta(
 
     Parameters
     ----------
-    model           : DeepSSMPatternConditioned — meta-model (w_meta = model.parameters())
+    raw_model           : DeepSSMPatternConditioned — meta-model (w_meta = model.parameters())
     task_dict       : output of build_task_dict
                       {esm_name: {'support': ..., 'query': ..., 'weight': float}}
     num_epochs      : number of outer meta-update steps
@@ -339,7 +345,7 @@ def train_meta(
 
     Returns
     -------
-    model : DeepSSMPatternConditioned
+    raw_model : DeepSSMPatternConditioned
         Meta-model restored to the best (lowest meta-loss) checkpoint.
     """
     # Configure logger — outputs to stdout so it appears in cluster job logs
@@ -349,6 +355,18 @@ def train_meta(
         handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    use_cuda = torch.cuda.is_available()
+    backend = "nccl" if use_cuda else "gloo"
+    dist.init_process_group(backend)
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}") if use_cuda else torch.device("cpu")
+    raw_model = raw_model.to(device)
+
+    ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank} if use_cuda else {}
+    model = DDP(raw_model, **ddp_kwargs)
 
     meta_opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -369,7 +387,7 @@ def train_meta(
         model.train()
 
         # Snapshot current meta-parameters for inner-loop initialisation
-        w_meta = {name: p.detach().clone() for name, p in model.named_parameters()}
+        w_meta = {name: p.detach().clone() for name, p in raw_model.named_parameters()}
 
         meta_loss_val    = 0.0
         per_task_details = {}   # {esm_name: (loss, nll, nll_pr, kl, mse_tas, mse_pr, mse_yr)}
@@ -381,7 +399,7 @@ def train_meta(
 
             # Adapt to support set
             query_model = inner_loop(
-                w_meta, model, task, alpha, num_inner_steps, device,
+                w_meta, raw_model, task, alpha, num_inner_steps, device,
                 batch_size=batch_size,
                 kl_w=kl_w, alpha_w=alpha_w, omega_w=omega_w, gamma_w=gamma_w,
             )
@@ -402,10 +420,7 @@ def train_meta(
             )
             meta_loss_val += weight * loss_query.item()
 
-            # Bug 1 fix (FOMAML): backprop through query_model and accumulate
-            # gradients into the meta-model manually. query_model parameters are
-            # detached from model, so there is no automatic gradient path —
-            # the FOMAML approximation treats the inner-loop Jacobian as identity.
+        
             (weight * loss_query).backward()
             for meta_p, qry_p in zip(model.parameters(), query_model.parameters()):
                 if meta_p.requires_grad and qry_p.grad is not None:
@@ -413,6 +428,14 @@ def train_meta(
                         meta_p.grad = qry_p.grad.clone()
                     else:
                         meta_p.grad += qry_p.grad
+
+        # ---- Synchronise gradients across ranks ----
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            for p in model.parameters():
+                if p.requires_grad and p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad.div_(world_size)
 
         # ---- Outer gradient step ----
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -442,24 +465,26 @@ def train_meta(
             ckpt_dir = os.path.join(run_dir, "checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt_path = os.path.join(ckpt_dir, f"meta_epoch{epoch:04d}.pt")
-            torch.save(model.state_dict(), ckpt_path)
+            torch.save(raw_model.state_dict(), ckpt_path)
             logger.info(f"  checkpoint saved → {ckpt_path}")
 
     # Restore best model
     if best_state is not None:
-        model.load_state_dict(best_state)
+        raw_model.load_state_dict(best_state)
         logger.info(f"Restored best meta-model (loss={best_meta_loss:.4f})")
 
-    return model
+    return raw_model
 
 
 
 if __name__ == "__main__":
+    faulthandler.enable()
+    _local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    models = ['CanESM5','ACCESS-ESM1-5']
-    weights = [1.,1.]
+    models = ['CanESM5','ACCESS-ESM1-5','IPSL-CM6A-LR','MPI-ESM1-2-LR','MIROC6']
+    weights = [1.,1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
-    TRAIN_SCENARIOS = [ 'ssp585','1pctco2']#,'ssp534-over','flat10cdrincspinoff','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
+    TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
     N = 200 
     PATTERN_SCALING_RESIDUALS = False
     RAMP_DOWN_CORRECTED_PS = False
@@ -514,8 +539,14 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load(weights_file, map_location=device))
     print(f"Loaded weights from {weights_file}")
 
-    train_meta(model=model,task_dict=tasks,num_epochs=10,num_inner_steps=1,alpha=1e-3,beta=1e-4,run_dir=run_dir,
-        batch_size=250,device = device)
+    try:
+        model = train_meta(model=model,task_dict=tasks,num_epochs=100,num_inner_steps=3,alpha=1e-3,beta=1e-4,run_dir=run_dir,
+            batch_size=250,device = device)
+    except Exception:
+        print(f"[Rank {_local_rank}] run_train failed:", flush=True)
+        traceback.print_exc()
+        raise
+    torch.save(model.state_dict(), os.path.join(run_dir, "model_maml_out"))
 
 
     

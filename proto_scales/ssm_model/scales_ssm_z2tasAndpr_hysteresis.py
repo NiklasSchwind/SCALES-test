@@ -397,11 +397,9 @@ class DeepSSMPatternConditioned(nn.Module):
 
                 out = self.emit_pr(e_in)
                 mu_t, log_sigma_t, eps_skew_t, log_delta_t = torch.chunk(out, 4, dim=-1)
-                sigma_pr = torch.exp(log_sigma_t) + self.eps
-                x_samp = mu_t + sigma_pr * torch.randn_like(mu_t)
 
                 y_s = y_hat
-                y_s_pr = sinh_arcsinh_forward(x_samp, eps_skew_t, log_delta_t, eps=self.eps)
+                y_s_pr = sinh_arcsinh_forward(mu_t, eps_skew_t, log_delta_t, eps=self.eps)
                 preds.append(y_s)
                 preds_pr.append(y_s_pr)
 
