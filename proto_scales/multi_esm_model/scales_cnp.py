@@ -833,9 +833,9 @@ if __name__ == "__main__":
     weights = [1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
     TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
-    maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260526_135511/checkpoints/meta_epoch0010.pt"
+    maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260601_142125/checkpoints/meta_epoch0100.pt"
 
-    run_dir = os.path.join("outputs_ssm_scales", "scales_maml_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    run_dir = os.path.join("outputs_ssm_scales", "scales_cnp_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "train_scenarios.txt"), "w") as f:
         f.write("\n".join(TRAIN_SCENARIOS))
@@ -879,7 +879,7 @@ if __name__ == "__main__":
 
     model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)    
 
-    model = train_cnp(model=model,task_dict=tasks,num_epochs=10,horizon=1200,run_dir=run_dir,weights_file=maml_weights_file,device=device)
+    model = train_cnp(model=model,task_dict=tasks,num_epochs=10,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=maml_weights_file,device=device)
 
     
 
