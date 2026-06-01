@@ -618,17 +618,23 @@ def train_cnp(
     device="cuda",
     patience=15,
     weights_file=None,
+    unfreeze_frac=0.3,
+    lr_ssm_unfrozen=2e-4,
 ):
     """
     Train a DeepCnpSsmforESM model on a task dictionary.
 
     task_dict : {esm_name: {'support': UnifiedWindowDataset, 'query': UnifiedWindowDataset, 'weight': float}}
         support  → training set,  query → validation set  (already normalised by build_task_dict)
-    horizon      : forecast horizon in time steps (must match the datasets)
-    weights_file : path to a pretrained DeepSSMPatternConditioned state dict.
+    horizon          : forecast horizon in time steps (must match the datasets)
+    weights_file     : path to a pretrained DeepSSMPatternConditioned state dict.
         If provided, those weights are loaded into model.ssm and all SSM sub-modules
         are frozen except the emission heads (emit, emit_pr).  The CNP modules
         (ctx_encoder, lat_encoder, z_cnp_proj) are always trainable.
+    unfreeze_frac    : fraction of num_epochs after which all SSM weights are unfrozen.
+        Only has effect when weights_file is set. Default 0.3 (after 30 % of epochs).
+    lr_ssm_unfrozen  : learning rate applied to the newly unfrozen SSM parameters.
+        Typically lower than lr to avoid disrupting pretrained weights.
 
     Loss (mirrors run_train):
         nll + nll_pr + kl_w*kl_ssm + kl_cnp_w*kl_cnp
@@ -638,13 +644,16 @@ def train_cnp(
     """
     model = model.to(device)
 
+    ssm_frozen = False
+    unfreeze_epoch = int(unfreeze_frac * num_epochs) + 1
+
     if weights_file is not None:
         model.ssm.load_state_dict(torch.load(weights_file, map_location=device))
         print(f"Loaded SSM weights from {weights_file}")
-        # Freeze all SSM parameters except the emission heads
         for name, p in model.ssm.named_parameters():
             p.requires_grad = name.startswith("emit")
-        print("SSM frozen except emit and emit_pr; CNP modules trainable.")
+        print(f"SSM frozen except emit and emit_pr; will unfreeze all at epoch {unfreeze_epoch}.")
+        ssm_frozen = True
 
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=lr
@@ -668,6 +677,14 @@ def train_cnp(
     alpha = omega = 0.0   # annealed weights — persist into validation
 
     for epoch in range(1, num_epochs + 1):
+
+        if ssm_frozen and epoch == unfreeze_epoch:
+            for p in model.ssm.parameters():
+                p.requires_grad = True
+            opt.add_param_group({"params": list(model.ssm.parameters()), "lr": lr_ssm_unfrozen})
+            ssm_frozen = False
+            print(f"Epoch {epoch}: unfroze all SSM weights (lr={lr_ssm_unfrozen}).")
+
         model.train()
         tr_losses = []
 
@@ -812,16 +829,10 @@ def train_cnp(
 
 if __name__ == "__main__":
 
-    models = ['CanESM5','ACCESS-ESM1-5']
-    weights = [1.,1.]
+    models = ['CanESM5','ACCESS-ESM1-5','MPI-ESM1-2-LR','MIROC6']
+    weights = [1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
-    TRAIN_SCENARIOS = [ 'ssp585','1pctco2']#,'ssp534-over','flat10cdrincspinoff','ssp126','flat10zecincspinoff', 'flat10cdrincspinoff']#,'abrupt4xco2','ssp119','ssp460','ssp370']
-    N = 200 
-    PATTERN_SCALING_RESIDUALS = False
-    RAMP_DOWN_CORRECTED_PS = False
-    monthly_flag = True
-    use_smoothing = False
-    train_pattern_scaling_name = 'ssp585'
+    TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
     maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260526_135511/checkpoints/meta_epoch0010.pt"
 
     run_dir = os.path.join("outputs_ssm_scales", "scales_maml_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -868,7 +879,7 @@ if __name__ == "__main__":
 
     model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)    
 
-    model = train_cnp(model=model,task_dict=tasks,num_epochs=10,horizon=1200,run_dir=run_dir)
+    model = train_cnp(model=model,task_dict=tasks,num_epochs=10,horizon=1200,run_dir=run_dir,weights_file=maml_weights_file,device=device)
 
     
 
