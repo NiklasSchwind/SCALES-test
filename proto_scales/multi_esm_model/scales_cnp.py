@@ -833,7 +833,7 @@ if __name__ == "__main__":
     weights = [1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
     TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
-    maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260528_14031/checkpoints/meta_epoch0100.pt"
+    maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260528_140312/checkpoints/meta_epoch0100.pt"
 
     run_dir = os.path.join("outputs_ssm_scales", "scales_cnp_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
