@@ -679,9 +679,10 @@ def train_cnp(
     for epoch in range(1, num_epochs + 1):
 
         if ssm_frozen and epoch == unfreeze_epoch:
+            newly_unfrozen = [p for p in model.ssm.parameters() if not p.requires_grad]
             for p in model.ssm.parameters():
                 p.requires_grad = True
-            opt.add_param_group({"params": list(model.ssm.parameters()), "lr": lr_ssm_unfrozen})
+            opt.add_param_group({"params": newly_unfrozen, "lr": lr_ssm_unfrozen})
             ssm_frozen = False
             print(f"Epoch {epoch}: unfroze all SSM weights (lr={lr_ssm_unfrozen}).")
 
