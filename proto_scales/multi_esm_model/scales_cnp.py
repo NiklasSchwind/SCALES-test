@@ -288,8 +288,10 @@ class DeepCnpSsmforESM(nn.Module):
 
     A context set of (u, y, pr) point-pairs from the target ESM is encoded to a
     task-specific latent z_cnp via ContextEncoderForCnp + CnpLatentEncoder.
-    z_cnp is injected into every SSM emission step by adding z_cnp_proj(z_cnp)
-    to e_in before emit / emit_pr, so both the tas and pr heads adapt to the ESM.
+    z_cnp modulates every SSM emission step via FiLM (Feature-wise Linear Modulation):
+        e_in_conditioned = gamma(z_cnp) * e_in + beta(z_cnp)
+    applied before emit / emit_pr, allowing the ESM embedding to both rescale and
+    shift how the emission networks respond to the current SSM state.
 
     Training objective:
         nll + nll_pr + kl_ssm_w * kl_ssm + kl_cnp_w * kl_cnp
@@ -308,14 +310,15 @@ class DeepCnpSsmforESM(nn.Module):
         self.ctx_encoder = ContextEncoderForCnp(x_dim=x_dim, y_dim=state_dim, r_dim=r_dim)
         self.lat_encoder = CnpLatentEncoder(r_dim=r_dim, z_dim=z_cnp_dim)
 
-        # Project z_cnp to SSM emission-input dimension for additive injection
+        # FiLM layers: project z_cnp to scale (gamma) and shift (beta) for e_in
         if ssm_model.emission_uses_u:
             emit_in_dim = (ssm_model.z_dim
                            + ssm_model.u_rnn_hidden
                            + ssm_model.y_dim * ssm_model.reservoir_dim)
         else:
             emit_in_dim = ssm_model.z_dim
-        self.z_cnp_proj = nn.Linear(z_cnp_dim, emit_in_dim)
+        self.z_cnp_scale = nn.Linear(z_cnp_dim, emit_in_dim)
+        self.z_cnp_shift = nn.Linear(z_cnp_dim, emit_in_dim)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -357,7 +360,8 @@ class DeepCnpSsmforESM(nn.Module):
         """
         z_cnp, mu_cnp, sigma_cnp = self._encode_context(u_cnp, y_cnp, pr_cnp)
         kl_cnp     = self._kl_cnp(mu_cnp, sigma_cnp)
-        z_cnp_bias = self.z_cnp_proj(z_cnp)   # [B, emit_in_dim]
+        film_gamma = self.z_cnp_scale(z_cnp)   # [B, emit_in_dim]
+        film_beta  = self.z_cnp_shift(z_cnp)   # [B, emit_in_dim]
 
         ssm = self.ssm
         B, T, _ = y.shape
@@ -391,7 +395,7 @@ class DeepCnpSsmforESM(nn.Module):
             else:
                 e_in = z_t
 
-            e_in = e_in + z_cnp_bias   # ESM-specific offset
+            e_in = film_gamma * e_in + film_beta   # FiLM: ESM-specific scale and shift
 
             emit_out = ssm.emit(e_in)
             res, log_sigma_y_t = torch.chunk(emit_out, 2, dim=-1)
@@ -454,7 +458,8 @@ class DeepCnpSsmforESM(nn.Module):
             z_cnp, _, _ = self._encode_context(u_ctx, y_ctx, pr_ctx)
         else:
             z_cnp = torch.zeros(B, self.z_cnp_dim, device=y_ctx.device)
-        z_cnp_bias = self.z_cnp_proj(z_cnp)   # [B, emit_in_dim]
+        film_gamma = self.z_cnp_scale(z_cnp)   # [B, emit_in_dim]
+        film_beta  = self.z_cnp_shift(z_cnp)   # [B, emit_in_dim]
 
         rnn_in  = torch.cat([y_ctx, u_ctx], dim=-1)
         h, _    = ssm.gru(rnn_in)
@@ -492,7 +497,7 @@ class DeepCnpSsmforESM(nn.Module):
                 else:
                     e_in = z
 
-                e_in = e_in + z_cnp_bias
+                e_in = film_gamma * e_in + film_beta
 
                 emit_out = ssm.emit(e_in)
                 res, log_sigma_y_t = torch.chunk(emit_out, 2, dim=-1)
@@ -537,7 +542,8 @@ class DeepCnpSsmforESM(nn.Module):
             z_cnp, _, _ = self._encode_context(u_ctx, y_ctx, pr_ctx)
         else:
             z_cnp = torch.zeros(B, self.z_cnp_dim, device=y_ctx.device)
-        z_cnp_bias = self.z_cnp_proj(z_cnp)
+        film_gamma = self.z_cnp_scale(z_cnp)
+        film_beta  = self.z_cnp_shift(z_cnp)
 
         rnn_in  = torch.cat([y_ctx, u_ctx], dim=-1)
         h, _    = ssm.gru(rnn_in)
@@ -575,7 +581,7 @@ class DeepCnpSsmforESM(nn.Module):
                 else:
                     e_in = z
 
-                e_in = e_in + z_cnp_bias
+                e_in = film_gamma * e_in + film_beta
 
                 emit_out = ssm.emit(e_in)
                 res, _ = torch.chunk(emit_out, 2, dim=-1)
@@ -630,7 +636,7 @@ def train_cnp(
     weights_file     : path to a pretrained DeepSSMPatternConditioned state dict.
         If provided, those weights are loaded into model.ssm and all SSM sub-modules
         are frozen except the emission heads (emit, emit_pr).  The CNP modules
-        (ctx_encoder, lat_encoder, z_cnp_proj) are always trainable.
+        (ctx_encoder, lat_encoder, z_cnp_scale, z_cnp_shift) are always trainable.
     unfreeze_frac    : fraction of num_epochs after which all SSM weights are unfrozen.
         Only has effect when weights_file is set. Default 0.3 (after 30 % of epochs).
     lr_ssm_unfrozen  : learning rate applied to the newly unfrozen SSM parameters.
