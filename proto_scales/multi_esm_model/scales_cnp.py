@@ -625,7 +625,7 @@ def train_cnp(
     patience=15,
     weights_file=None,
     unfreeze_frac=0.3,
-    lr_ssm_unfrozen=2e-4,
+    lr_ssm_unfrozen=2e-3,
 ):
     """
     Train a DeepCnpSsmforESM model on a task dictionary.
