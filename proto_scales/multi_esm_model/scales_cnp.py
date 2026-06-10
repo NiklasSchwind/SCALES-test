@@ -886,7 +886,7 @@ if __name__ == "__main__":
 
     model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)    
 
-    model = train_cnp(model=model,task_dict=tasks,num_epochs=500,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=maml_weights_file,device=device)
+    model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=maml_weights_file,device=device)
 
     
 
