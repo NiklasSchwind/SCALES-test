@@ -666,20 +666,35 @@ def train_cnp(
     )
 
     train_loaders = {
-        name: DataLoader(task['support'], batch_size=batch_size, shuffle=True,  drop_last=True)
+        name: DataLoader(task['support'], batch_size=batch_size, shuffle=True, drop_last=True)
         for name, task in task_dict.items()
     }
     val_loaders = {
-        name: DataLoader(task['query'],   batch_size=batch_size, shuffle=False)
+        name: DataLoader(task['query'], batch_size=batch_size, shuffle=False)
         for name, task in task_dict.items()
     }
+
+    # Inverse-frequency weights: up-weight ESMs with fewer support samples so
+    # every ESM contributes equally to the expected loss regardless of dataset size.
+    # Normalized so the mean weight across ESMs is 1 (keeps overall loss scale stable).
+    n_support    = {name: len(task['support']) for name, task in task_dict.items()}
+    max_n        = max(n_support.values())
+    raw_weights  = {name: max_n / n for name, n in n_support.items()}
+    w_mean       = sum(raw_weights.values()) / len(raw_weights)
+    task_weights = {name: w / w_mean for name, w in raw_weights.items()}
+    print("Inverse-frequency task weights:",
+          {name: f"{w:.2f}" for name, w in task_weights.items()})
+
+    # Balanced iteration: every ESM takes the same number of steps per epoch,
+    # matching the richest ESM. Sparse ESMs cycle through their loader multiple times.
+    steps_per_esm = max(len(dl) for dl in train_loaders.values())
+    total_steps   = num_epochs * steps_per_esm * len(task_dict)
+    train_iters   = {name: iter(dl) for name, dl in train_loaders.items()}
 
     best_val      = float('inf')
     best_state    = None
     patience_left = patience
-
-    total_steps = num_epochs * sum(len(dl) for dl in train_loaders.values())
-    global_step = 0
+    global_step   = 0
     alpha = omega = 0.0   # annealed weights — persist into validation
 
     for epoch in range(1, num_epochs + 1):
@@ -695,16 +710,20 @@ def train_cnp(
         model.train()
         tr_losses = []
 
-        for esm_name, loader in train_loaders.items():
-            weight = task_dict[esm_name].get('weight', 1.0)
+        for _ in range(steps_per_esm):
+            for esm_name in task_dict:
+                weight = task_weights[esm_name]
 
-            for y_ctx, pr_ctx, u_ctx, u_fut, pr_fut, y_fut in loader:
-                y_ctx  = y_ctx.float().to(device)
-                pr_ctx = pr_ctx.float().to(device)
-                u_ctx  = u_ctx.float().to(device)
-                u_fut  = u_fut.float().to(device)
-                pr_fut = pr_fut.float().to(device)
-                y_fut  = y_fut.float().to(device)
+                # Advance iterator; reshuffle when the loader is exhausted
+                try:
+                    batch = next(train_iters[esm_name])
+                except StopIteration:
+                    train_iters[esm_name] = iter(train_loaders[esm_name])
+                    batch = next(train_iters[esm_name])
+
+                y_ctx, pr_ctx, u_ctx, u_fut, pr_fut, y_fut = [
+                    t.float().to(device) for t in batch
+                ]
 
                 y_full  = torch.cat([y_ctx,  y_fut],  dim=1)
                 pr_full = torch.cat([pr_ctx, pr_fut], dim=1)
@@ -841,6 +860,7 @@ if __name__ == "__main__":
     INDICATORS = ['tas','pr']
     TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
     maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260528_140312/checkpoints/meta_epoch0100.pt"
+    cnp_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/checkpoints/cnp_epoch2000.pt"
 
     run_dir = os.path.join("outputs_ssm_scales", "scales_cnp_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
@@ -884,7 +904,8 @@ if __name__ == "__main__":
     model_ssm = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=zdim,rnn_hidden=rnn_hidden,use_linear_model=use_linear_model,
                                  emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max).to(device)
 
-    model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)    
+    model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)
+    model.load_state_dict(torch.load(cnp_weights_file, map_location=device))    
 
     model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=maml_weights_file,device=device)
 
