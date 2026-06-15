@@ -666,7 +666,12 @@ def train_cnp(
     )
 
     train_loaders = {
-        name: DataLoader(task['support'], batch_size=batch_size, shuffle=True, drop_last=True)
+        name: DataLoader(
+            task['support'],
+            batch_size=min(batch_size, len(task['support'])),
+            shuffle=True,
+            drop_last=True,
+        )
         for name, task in task_dict.items()
     }
     val_loaders = {
