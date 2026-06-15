@@ -905,9 +905,9 @@ if __name__ == "__main__":
                                  emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max).to(device)
 
     model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)
-    model.load_state_dict(torch.load(cnp_weights_file, map_location=device))    
+    model.load_state_dict(torch.load(cnp_weights_file, map_location=device))# starting from existing model    
 
-    model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=maml_weights_file,device=device)
+    model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=None,device=device)
 
     
 
