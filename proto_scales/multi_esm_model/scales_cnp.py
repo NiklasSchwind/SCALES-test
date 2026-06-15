@@ -687,13 +687,8 @@ def train_cnp(
 
     # Balanced iteration: every ESM takes the same number of steps per epoch,
     # matching the richest ESM. Sparse ESMs cycle through their loader multiple times.
-    def _infinite(loader):
-        while True:
-            yield from loader
-
     steps_per_esm = max(len(dl) for dl in train_loaders.values())
     total_steps   = num_epochs * steps_per_esm * len(task_dict)
-    train_iters   = {name: _infinite(dl) for name, dl in train_loaders.items()}
 
     best_val      = float('inf')
     best_state    = None
@@ -714,11 +709,18 @@ def train_cnp(
         model.train()
         tr_losses = []
 
+        # Fresh iterators each epoch — no state carried across epoch boundaries
+        train_iters = {name: iter(dl) for name, dl in train_loaders.items()}
+
         for _ in range(steps_per_esm):
             for esm_name in task_dict:
                 weight = task_weights[esm_name]
 
-                batch = next(train_iters[esm_name])
+                try:
+                    batch = next(train_iters[esm_name])
+                except StopIteration:
+                    train_iters[esm_name] = iter(train_loaders[esm_name])
+                    batch = next(train_iters[esm_name])
 
                 y_ctx, pr_ctx, u_ctx, u_fut, pr_fut, y_fut = [
                     t.float().to(device) for t in batch
