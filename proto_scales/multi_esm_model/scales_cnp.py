@@ -441,25 +441,28 @@ class DeepCnpSsmforESM(nn.Module):
     def forecast(
         self,
         y_ctx, u_ctx, u_fut, steps, n_samples=50,
-        pr_ctx=None,
+        pr_ctx=None, override_esm=False,
     ):
         """
         y_ctx, u_ctx : [B, Tc, *]   — SSM warm-up context (time series); reused as CNP context.
         u_fut        : [B, steps, u_dim]
         pr_ctx       : [B, Tc, y_dim] — precipitation context for CNP encoding.
-            If None, z_cnp = 0 (no ESM-specific adaptation).
+            If None and override_esm is False, z_cnp = 0 (no ESM-specific adaptation).
+        override_esm : if True, a fresh z_cnp ~ N(0,I) is drawn for each of the n_samples
+            rollouts, marginalising over ESM identity jointly with SSM stochasticity.
 
         Returns mean, q10, q90 for tas and pr — each [B, steps, y_dim].
         """
         B   = y_ctx.shape[0]
         ssm = self.ssm
 
-        if pr_ctx is not None:
-            z_cnp, _, _ = self._encode_context(u_ctx, y_ctx, pr_ctx)
-        else:
-            z_cnp = torch.zeros(B, self.z_cnp_dim, device=y_ctx.device)
-        film_gamma = self.z_cnp_scale(z_cnp)   # [B, emit_in_dim]
-        film_beta  = self.z_cnp_shift(z_cnp)   # [B, emit_in_dim]
+        if not override_esm:
+            if pr_ctx is not None:
+                z_cnp, _, _ = self._encode_context(u_ctx, y_ctx, pr_ctx)
+            else:
+                z_cnp = torch.zeros(B, self.z_cnp_dim, device=y_ctx.device)
+            film_gamma = self.z_cnp_scale(z_cnp)   # [B, emit_in_dim]
+            film_beta  = self.z_cnp_shift(z_cnp)   # [B, emit_in_dim]
 
         rnn_in  = torch.cat([y_ctx, u_ctx], dim=-1)
         h, _    = ssm.gru(rnn_in)
@@ -475,6 +478,11 @@ class DeepCnpSsmforESM(nn.Module):
 
         ysamps, ysamps_pr = [], []
         for _ in range(n_samples):
+            if override_esm:
+                z_cnp      = torch.randn(B, self.z_cnp_dim, device=y_ctx.device)
+                film_gamma = self.z_cnp_scale(z_cnp)
+                film_beta  = self.z_cnp_shift(z_cnp)
+
             z     = ssm.sample(mu_qT, logvar_qT)
             h_u_s = h_u.clone() if ssm.emission_uses_u else None
             s     = s_ctx.clone() if ssm.emission_uses_u else None
@@ -529,21 +537,24 @@ class DeepCnpSsmforESM(nn.Module):
     def forecast_deterministic(
         self,
         y_ctx, u_ctx, u_fut, steps, n_samples=50,
-        pr_ctx=None,
+        pr_ctx=None, override_esm=False,
     ):
         """
         Same signature as forecast. Uses mean y_hat (no additive sigma noise for tas).
+        override_esm : if True, a fresh z_cnp ~ N(0,I) is drawn for each of the n_samples
+            rollouts, marginalising over ESM identity jointly with SSM stochasticity.
         Returns mean, q10, q90 for tas and pr — each [B, steps, y_dim].
         """
         B   = y_ctx.shape[0]
         ssm = self.ssm
 
-        if pr_ctx is not None:
-            z_cnp, _, _ = self._encode_context(u_ctx, y_ctx, pr_ctx)
-        else:
-            z_cnp = torch.zeros(B, self.z_cnp_dim, device=y_ctx.device)
-        film_gamma = self.z_cnp_scale(z_cnp)
-        film_beta  = self.z_cnp_shift(z_cnp)
+        if not override_esm:
+            if pr_ctx is not None:
+                z_cnp, _, _ = self._encode_context(u_ctx, y_ctx, pr_ctx)
+            else:
+                z_cnp = torch.zeros(B, self.z_cnp_dim, device=y_ctx.device)
+            film_gamma = self.z_cnp_scale(z_cnp)
+            film_beta  = self.z_cnp_shift(z_cnp)
 
         rnn_in  = torch.cat([y_ctx, u_ctx], dim=-1)
         h, _    = ssm.gru(rnn_in)
@@ -559,6 +570,11 @@ class DeepCnpSsmforESM(nn.Module):
 
         ysamps, ysamps_pr = [], []
         for _ in range(n_samples):
+            if override_esm:
+                z_cnp      = torch.randn(B, self.z_cnp_dim, device=y_ctx.device)
+                film_gamma = self.z_cnp_scale(z_cnp)
+                film_beta  = self.z_cnp_shift(z_cnp)
+
             z     = ssm.sample(mu_qT, logvar_qT)
             h_u_s = h_u.clone() if ssm.emission_uses_u else None
             s     = s_ctx.clone() if ssm.emission_uses_u else None
