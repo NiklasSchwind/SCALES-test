@@ -61,16 +61,22 @@ copied, partial, skipped = [], [], []
 
 for name in corr_sd:
     if name == "emit.net.4.weight":
-        corr_sd[name] = torch.zeros_like(corr_sd[name])
-        corr_sd[name][: 2 * y_dim] = diag_sd["emit.net.4.weight"]
+        w = torch.zeros_like(corr_sd[name])
+        w[: 2 * y_dim] = diag_sd["emit.net.4.weight"]
+        # Small random noise breaks the zero-gradient trap: when U=0 the
+        # gradient d log p / dU = Σ⁻¹ rrᵀ Σ⁻¹ U - Σ⁻¹ U is identically
+        # zero, so the U rows would never train away from zero.
+        w[2 * y_dim :] = torch.randn_like(w[2 * y_dim :]) * 0.01
+        corr_sd[name] = w
         partial.append(
-            f"  {name}  rows copied={2*y_dim}/{corr_sd[name].shape[0]}  rest=zero"
+            f"  {name}  rows copied={2*y_dim}/{w.shape[0]}  rest=N(0,0.01)"
         )
     elif name == "emit.net.4.bias":
-        corr_sd[name] = torch.zeros_like(corr_sd[name])
-        corr_sd[name][: 2 * y_dim] = diag_sd["emit.net.4.bias"]
+        b = torch.zeros_like(corr_sd[name])
+        b[: 2 * y_dim] = diag_sd["emit.net.4.bias"]
+        corr_sd[name] = b
         partial.append(
-            f"  {name}  entries copied={2*y_dim}/{corr_sd[name].shape[0]}  rest=zero"
+            f"  {name}  entries copied={2*y_dim}/{b.shape[0]}  rest=zero"
         )
     elif name in diag_sd and diag_sd[name].shape == corr_sd[name].shape:
         corr_sd[name] = diag_sd[name].clone()
