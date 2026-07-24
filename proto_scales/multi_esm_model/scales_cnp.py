@@ -877,8 +877,8 @@ def train_cnp(
 
 if __name__ == "__main__":
 
-    models = ['CanESM5','ACCESS-ESM1-5','MPI-ESM1-2-LR','MIROC6']
-    weights = [1.,1.,1.,1.]
+    models = ['CanESM5','ACCESS-ESM1-5','MPI-ESM1-2-LR','MIROC6','IPSL-CM6A-LR']
+    weights = [1.,1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
     TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
     maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260528_140312/checkpoints/meta_epoch0100.pt"
@@ -927,9 +927,9 @@ if __name__ == "__main__":
                                  emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max).to(device)
 
     model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)
-    model.load_state_dict(torch.load(cnp_weights_file, map_location=device))# starting from existing model    
+    #model.load_state_dict(torch.load(cnp_weights_file, map_location=device))# starting from existing model    
 
-    model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=None,device=device)
+    model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=maml_weights_file,device=device)
 
     
 
