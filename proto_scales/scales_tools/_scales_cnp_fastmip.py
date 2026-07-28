@@ -141,6 +141,7 @@ def project_for_ESM(esm_name,esm_member_index,gmt_future, n_ensemble):
     return output_data
 
 
+device = "cpu"
 path = "/pdrive/projects/icigroup/projects/FastMIP/scenarios/"
 scenarios = os.listdir('/pdrive/projects/icigroup/projects/FastMIP/scenarios/')
 scenario_index = 5
