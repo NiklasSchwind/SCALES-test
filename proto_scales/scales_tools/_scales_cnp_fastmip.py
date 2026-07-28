@@ -23,6 +23,7 @@ from sklearn.linear_model import LinearRegression
 import proto_scales.data_prep.prepare_data as prep
 from proto_scales.ssm_model.scales_ssm import StandardScaler
 from proto_scales.multi_esm_model.scales_cnp import DeepCnpSsmforESM,DeepSSMPatternConditioned
+import cftime
 
 
 @torch.no_grad()
