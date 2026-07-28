@@ -25,6 +25,14 @@ from proto_scales.ssm_model.scales_ssm import StandardScaler
 from proto_scales.multi_esm_model.scales_cnp import DeepCnpSsmforESM,DeepSSMPatternConditioned
 import cftime
 
+region_names = ['ARO', 'ARP', 'ARS', 'BOB', 'CAF', 'CAR', 'CAU',
+       'CNA', 'EAN', 'EAO', 'EAS', 'EAU', 'ECA', 'EEU', 'EIO', 'ENA', 'EPO',
+       'ESAF', 'ESB', 'GIC', 'MDG', 'MED', 'NAO', 'NAU', 'NCA', 'NEAF', 'NEN',
+       'NES', 'NEU', 'NPO', 'NSA', 'NWN', 'NWS', 'NZ', 'RAR', 'RFE', 'SAH',
+       'SAM', 'SAO', 'SAS', 'SAU', 'SCA', 'SEA', 'SEAF', 'SES', 'SIO', 'SOO',
+       'SPO', 'SSA', 'SWS', 'TIB', 'WAF', 'WAN', 'WCA', 'WCE', 'WNA', 'WSAF',
+       'WSB']
+
 
 @torch.no_grad()
 def forecast(model, y_ctx, u_ctx, pr_ctx, u_fut,n_samples = 1):
@@ -97,8 +105,7 @@ def project_for_ESM(esm_name,esm_member_index,gmt_future, n_ensemble,cnp_model):
     idx = range(n_ensemble)
     
 
-    MODEL = esm_name
-    test_data_np = model_data[MODEL]
+    test_data_np = model_data[esm_name]
 
     Tc_test = 600
     H =2100
@@ -140,7 +147,6 @@ def project_for_ESM(esm_name,esm_member_index,gmt_future, n_ensemble,cnp_model):
     output_data["tas_lin_yearly"] = y_yearly_mean_lin
     output_data["calibration_indices"] = idx
     return output_data
-
 
 device = "cpu"
 path = "/pdrive/projects/icigroup/projects/FastMIP/scenarios/"
