@@ -153,7 +153,7 @@ u_fastmip,df_monthly,gmt_cols = get_fastmip_gmt(files[scenario_index])
 
 
 scaler_path ="/home/kainverena/PythonProjects/outputs_ssm_scales/scales_cnp_20260724_130848/"
-model_filename = scaler_path+"checkpoints/cnp_epoch1000.pt" 
+model_filename = scaler_path+"checkpoints/cnp_epoch0840.pt" 
 zdim = 64
 rnn_hidden=256
 use_linear_model = True
