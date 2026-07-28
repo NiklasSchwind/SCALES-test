@@ -90,7 +90,7 @@ def prepare_data_for_inference(t_horizon,t_context,raw_data):
     u_future = np.expand_dims(test_gmt[:,t_context:t_context+t_horizon],axis=2)
     return y_past, pr_past, u_past, u_future,tas_test,pr_test
 
-def project_for_ESM(esm_name,esm_member_index,gmt_future, n_ensemble):
+def project_for_ESM(esm_name,esm_member_index,gmt_future, n_ensemble,cnp_model):
     rng = np.random.default_rng(seed=42)
     #idx = rng.choice(len(U_future_access), size=30, replace=False)
     idx = range(n_ensemble)
@@ -118,7 +118,7 @@ def project_for_ESM(esm_name,esm_member_index,gmt_future, n_ensemble):
     pr_past_n  = torch.tensor(pr_past_n,  device=device, dtype=torch.float32)
     
     with torch.no_grad():
-        y_ssm, y_lin, pr_ssm = forecast(model, y_past_n, u_past_n, pr_past_n, u_future_n, n_samples=1)
+        y_ssm, y_lin, pr_ssm = forecast(cnp_model, y_past_n, u_past_n, pr_past_n, u_future_n, n_samples=1)
     y_pred     = y_scaler.inverse_transform(y_ssm.cpu().numpy())
     pr_pred    = pr_scaler.inverse_transform(pr_ssm.cpu().numpy())
     y_pred_lin = y_scaler.inverse_transform(y_lin.cpu().numpy())
@@ -178,11 +178,25 @@ TEST_SCENARIOS = ['ssp245']
 
 model_data = create_all_model_test_dict(models,INDICATORS,TEST_SCENARIOS)
 
+device = "cpu"
+Dy = 58#tas_test.shape[-1]
+Du = 1#test_gmt.shape[-1]
+
+# model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=zdim,rnn_hidden=rnn_hidden,use_linear_model=use_linear_model,
+#                                  emission_uses_u=emission_uses_u).to(device)
+model_ssm = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=zdim,rnn_hidden=rnn_hidden,use_linear_model=use_linear_model,
+                                 emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max).to(device)
+
+
+model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)  
+model.load_state_dict(torch.load(model_filename, map_location=torch.device(device)))
+model.eval()
+
 ds_list = []
 
 for esm_name in models:
     data = project_for_ESM(esm_name=esm_name, esm_member_index=0,
-                           gmt_future=u_fastmip, n_ensemble=100)
+                           gmt_future=u_fastmip, n_ensemble=100,cnp_model=model)
     y_pred   = data["tas"]
     pr_pred  = data["pr"]
     idx      = data["calibration_indices"]
