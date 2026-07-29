@@ -14,7 +14,7 @@ from datetime import datetime
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas','pr']
 TEST_SCENARIOS = ['ssp245']
-TRAIN_SCENARIOS = [ 'ssp585','esm-1pct-brch-1000pgc-from-025', 'esm-1pct-brch-750pgc-from-025', 'esm-1pct-brch-2000pgc-from-025','ssp460','ssp245','ssp534-over-from-025','abrupt-4xco2','flat10-cdr-from-025', 'flat10-zec-from-025', 'flat10-from-025','ssp370']#'ssp126'#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt-4xco2','ssp119','ssp460','ssp370']
+TRAIN_SCENARIOS = [ 'ssp585','esm-1pct-brch-1000pgc-from-025', 'esm-1pct-brch-750pgc-from-025', 'esm-1pct-brch-2000pgc-from-025','ssp460','ssp245','ssp534-over','abrupt-4xco2','flat10-cdr-from-025', 'flat10-zec-from-025', 'flat10-from-025','ssp370']#'ssp126'#,"ssp370",'ssp534-over','flat10zecincspinoff'',''flat10cdrincspinoff'','abrupt-4xco2','ssp119','ssp460','ssp370']
 N = 1800
 n_skip = 450
 ML_MODEL = 'feed_forward' 

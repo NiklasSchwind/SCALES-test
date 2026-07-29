@@ -881,9 +881,9 @@ if __name__ == "__main__":
     weights = [1.,1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
     #TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
-    TRAIN_SCENARIOS = [ 'ssp585','esm-1pct-brch-1000pgc-from-025','flat10-from-025', 'esm-1pct-brch-750pgc-from-025', 'esm-1pct-brch-2000pgc-from-025','ssp460','ssp534-over-from-025','abrupt-4xco2','flat10-zec-from-015','flat10-cdr-from-025','ssp126-from-025','ssp370']
+    TRAIN_SCENARIOS = [ 'ssp585','esm-1pct-brch-1000pgc-from-025','flat10-from-025', 'esm-1pct-brch-750pgc-from-025', 'esm-1pct-brch-2000pgc-from-025','ssp460','ssp534-over','abrupt-4xco2','flat10-zec-from-015','flat10-cdr-from-025','ssp126','ssp370']
     maml_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_maml_20260528_140312/checkpoints/meta_epoch0100.pt"
-    cnp_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_cnp_20260610_143643/checkpoints/cnp_epoch1950.pt"
+    cnp_weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_cnp_20260728_144949/checkpoints/cnp_epoch0190.pt"
 
     run_dir = os.path.join("outputs_ssm_scales", "scales_cnp_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
@@ -930,7 +930,7 @@ if __name__ == "__main__":
     model = DeepCnpSsmforESM(ssm_model=model_ssm,r_dim = 128, z_cnp_dim=32)
     #model.load_state_dict(torch.load(cnp_weights_file, map_location=device))# starting from existing model    
 
-    model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=maml_weights_file,device=device)
+    model = train_cnp(model=model,task_dict=tasks,num_epochs=2000,horizon=1200,batch_size=256,run_dir=run_dir,weights_file=None,device=device)
 
     
 
