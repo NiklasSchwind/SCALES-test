@@ -288,7 +288,7 @@ if __name__ == "__main__":
 
     # Scenario file list
     scenarios = sorted(os.listdir(SCENARIO_DIR))
-    files     = [os.path.join(SCENARIO_DIR, s) for s in scenarios if scenario.startswith("SSP")]
+    files     = [os.path.join(SCENARIO_DIR, s) for s in scenarios if s.startswith("SSP")]
 
     end = args.end if args.end >= 0 else len(files)
     plot_dir = OUT_DIR  # save plots alongside netcdf files
