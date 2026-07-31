@@ -40,6 +40,10 @@ def download_file(ftp, remote_dir, filename, local_dir):
     print(f"Downloaded {filename} to {os.path.abspath(local_path)}")
 
 
+HOST = "data.iac.ethz.ch"
+USER = "fastmip"#"user4fastmip"
+PASSWORD = "up$fast.mip"#"friendly"
+
 
 ftp = FTP(HOST)
 ftp.login(USER, PASSWORD)
