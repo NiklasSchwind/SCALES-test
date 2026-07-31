@@ -25,8 +25,11 @@ def upload_directory(ftp, local_dir, remote_dir):
     for filename in files:
         local_path = os.path.join(local_dir, filename)
         with open(local_path, "rb") as f:
-            ftp.storbinary(f"STOR {filename}", f)
-        print(f"Uploaded: {filename}")
+            try:
+              ftp.storbinary(f"STOR {filename}", f)
+              print(f"Uploaded: {filename}")
+            except error_perm as e:
+                print(f"Skipped {filename}: {e}")
     print(f"\nUploaded {len(files)} file(s) to {remote_dir}/")
 
 
