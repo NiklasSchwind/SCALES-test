@@ -45,7 +45,6 @@ def download_file(ftp, remote_dir, filename, local_dir):
 
 HOST = "data.iac.ethz.ch"
 USER = "fastmip"#"user4fastmip"
-PASSWORD = "up$fast.mip"#"friendly"
 
 
 ftp = FTP(HOST)
