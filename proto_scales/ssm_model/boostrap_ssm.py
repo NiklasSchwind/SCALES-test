@@ -25,10 +25,10 @@ use_linear_model = True
 emission_uses_u  = True
 alpha_max        = 0.002
 resevoir_dim     = 4
-cov_rank         = 5
+cov_rank         = 4
 
 #scaler_path    = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260514_171221/"
-model_filename = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260514_171221/model_out"
+model_filename = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260512_143221/model_out"
 # ─────────────────────────────────────────────────────────────────────────────
 
 diag_sd = torch.load(model_filename, map_location="cpu")
