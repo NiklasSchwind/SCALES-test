@@ -47,6 +47,8 @@ if __name__ == "__main__":
     parser.add_argument("--alpha_max", type=float, default=0.02, help="Maximum alpha for slow reservoir (controls minimum time constant)")
     parser.add_argument("--cov_rank", type=int, default=5, help="Rank of the low-rank component in the emission covariance")
     parser.add_argument("--weights_file", type=str, default=None, help="Path to existing model weights file to initialise training from")
+    parser.add_argument("--acf_max_lag", type=int, default=120, help="Max lag (months) for ACF loss; 0 disables it")
+    parser.add_argument("--acf_weight", type=float, default=5000.0, help="Weight for ACF loss term")
 
     args = parser.parse_args()
 
@@ -175,7 +177,8 @@ if __name__ == "__main__":
     try:
         model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=600, z_dim=64,rnn_hidden=256,horizon=1200,
             use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=args.alpha_max, resevoir_dim=args.reservoir,
-            cov_rank=args.cov_rank, run_dir=run_dir, weights_file=args.weights_file)
+            cov_rank=args.cov_rank, run_dir=run_dir, weights_file=args.weights_file,
+            acf_max_lag=args.acf_max_lag, acf_weight=args.acf_weight)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()

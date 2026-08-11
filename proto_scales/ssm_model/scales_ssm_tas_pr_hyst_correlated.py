@@ -419,6 +419,21 @@ class DeepSSMPatternConditioned(nn.Module):
         return samp.mean(0), samp.quantile(0.10, 0), samp.quantile(0.90, 0),samp_pr.mean(0),samp_pr.quantile(0.10, 0), samp_pr.quantile(0.90, 0)
 
 
+def batch_acf(x, max_lag, eps=1e-6):
+    """
+    Differentiable normalized ACF via FFT for lags 1..max_lag.
+    x: [B, T, D]
+    returns: [B, max_lag, D]  values in approximately [-1, 1]
+    """
+    B, T, D = x.shape
+    x = x - x.mean(dim=1, keepdim=True)
+    xp = F.pad(x, (0, 0, 0, T))                              # zero-pad to 2T, [B, 2T, D]
+    Xf = torch.fft.rfft(xp, dim=1)                           # [B, T+1, D]
+    acf = torch.fft.irfft(Xf * Xf.conj(), dim=1, n=2 * T)   # [B, 2T, D]
+    acf0 = acf[:, 0:1, :].clamp(min=eps)                     # lag-0 = sum x^2
+    return acf[:, 1:max_lag + 1, :] / acf0                   # [B, max_lag, D]
+
+
 def fit_control_mahalanobis(u_train_norm, eps=1e-6):
     """
     u_train_norm: [N, T, Du] standardized using train-only scaler
@@ -530,6 +545,8 @@ def run_train(
     cov_rank = 5,
     run_dir = None,
     weights_file = None,
+    acf_max_lag = 120,
+    acf_weight = 5000.0,
 ):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -670,16 +687,32 @@ def run_train(
             omega = 500   * frac
             gamma = 80000  # yearly trend loss weight — no warmup
 
+            # ACF loss: match normalized autocorrelation of rollout vs ground truth
+            # tas: compute on ctrl_lin residual to focus on internal variability
+            # pr:  batch_acf removes temporal mean internally
+            if acf_max_lag > 0 and horizon >= 2 * acf_max_lag:
+                with torch.no_grad():
+                    ctrl_fut = raw_model.ctrl_lin(u_fut.reshape(-1, Du)).reshape(B, horizon, Dy)
+                acf_pred_tas = batch_acf(mean - ctrl_fut, acf_max_lag)
+                acf_true_tas = batch_acf(y_fut - ctrl_fut, acf_max_lag)
+                acf_pred_pr  = batch_acf(mean_pr, acf_max_lag)
+                acf_true_pr  = batch_acf(pr_fut,  acf_max_lag)
+                acf_loss = (
+                    ((acf_pred_tas - acf_true_tas) ** 2).mean()
+                    + ((acf_pred_pr - acf_true_pr) ** 2).mean()
+                )
+            else:
+                acf_loss = torch.tensor(0.0, device=device)
 
-            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly
+            loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + omega*roll_out_mse_pr + gamma*roll_out_mse_yearly + acf_weight * frac * acf_loss
             #loss = nll + nll_pr + kl_w * kl + alpha*roll_out_mse + gamma*roll_out_mse_yearly
 
 
             if(global_step%100==0):
                 if(use_linear_model):
-                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item(),nll_pr.item(),roll_out_mse_pr.item(),roll_out_mse_yearly.item())
+                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),lin_mse.item(),nll_pr.item(),roll_out_mse_pr.item(),roll_out_mse_yearly.item(),acf_loss.item())
                 else:
-                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),nll_pr.item(),roll_out_mse_pr.item(),roll_out_mse_yearly.item())
+                    print("loss: ",nll.item(),kl_w,kl.item(),roll_out_mse.item(),nll_pr.item(),roll_out_mse_pr.item(),roll_out_mse_yearly.item(),acf_loss.item())
 
             opt.zero_grad()
             loss.backward()
