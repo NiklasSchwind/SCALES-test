@@ -530,11 +530,12 @@ if __name__ == "__main__":
     emission_uses_u =True
     alpha_max = 0.002
     resevoir_dim = 4
+    cov_rank = 4
 
     device = "cuda"
 
     model = DeepSSMPatternConditioned(y_dim=Dy, u_dim=Du, z_dim=zdim,rnn_hidden=rnn_hidden,use_linear_model=use_linear_model,
-                                 emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max).to(device)
+                                 emission_uses_u=emission_uses_u,reservoir_dim=resevoir_dim,alpha_max=alpha_max,cov_rank=4).to(device)
 
     
     model.load_state_dict(torch.load(weights_file, map_location=device))
