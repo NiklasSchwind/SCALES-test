@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from proto_scales.ssm_model.scales_ssm_z2tasAndpr_hysteresis import (
+from proto_scales.ssm_model.scales_ssm_tas_pr_hyst_correlated import (
     UnifiedWindowDataset,
     DeepSSMPatternConditioned,
 )
