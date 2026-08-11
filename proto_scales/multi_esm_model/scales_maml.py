@@ -481,17 +481,18 @@ if __name__ == "__main__":
     faulthandler.enable()
     _local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    models = ['CanESM5','ACCESS-ESM1-5','MPI-ESM1-2-LR','MIROC6'] #'IPSL-CM6A-LR',
-    weights = [1.,1.,1.,1.]
+    models = ['CanESM5','ACCESS-ESM1-5','MPI-ESM1-2-LR','MIROC6','IPSL-CM6A-LR']
+    weights = [1.,1.,1.,1.,1.]
     INDICATORS = ['tas','pr']
-    TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10zecincspinoff','flat10cdrincspinoff','ssp126','ssp370']
+    TRAIN_SCENARIOS = [ 'ssp585','1pctco2','ssp460','ssp534-over','abrupt-4xco2','flat10-cdr-from-025', 'flat10-zec-from-025', 'flat10-from-025','ssp126','ssp370','esm-1pct-brch-750pgc-from-025']
     N = 200 
     PATTERN_SCALING_RESIDUALS = False
     RAMP_DOWN_CORRECTED_PS = False
     monthly_flag = True
     use_smoothing = False
     train_pattern_scaling_name = 'ssp585'
-    weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260514_171221/model_out"
+    #weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260514_171221/model_out"
+    weights_file = "/home/kainverena/PythonProjects/outputs_ssm_scales/scales_20260810_123301/model_out"
 
     run_dir = os.path.join("outputs_ssm_scales", "scales_maml_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
