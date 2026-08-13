@@ -272,7 +272,11 @@ class DeepSSMPatternConditioned(nn.Module):
         factor   = emit_out[:, i:i + 2 * D * r];           i += 2 * D * r
         eps_skew = emit_out[:, i:i + D];                   i += D
         log_delta = emit_out[:, i:i + D];                  i += D
-        cov_diag = F.softplus(log_diag) + self.eps
+        # Clamp log_diag before softplus to avoid degenerate cov_diag (Cholesky
+        # in LowRankMultivariateNormal fails when I + Wᵀ D⁻¹ W becomes
+        # ill-conditioned — happens early in training when D underflows to 0).
+        log_diag = torch.clamp(log_diag, -8.0, 8.0)
+        cov_diag = F.softplus(log_diag) + 1e-4
         cov_factor = factor.reshape(B, 2 * D, r)
         return mu_joint, cov_factor, cov_diag, eps_skew, log_delta
 
