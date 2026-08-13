@@ -289,6 +289,7 @@ class DeepSSMPatternConditioned(nn.Module):
         if self.use_linear_model:
             mu_tas = mu_tas + self.ctrl_lin(u_t)
         mu_x = torch.cat([mu_tas, mu_pr], dim=-1)
+        mu_x = torch.clamp(mu_x, -50.0, 50.0)
         return mu_x, cov_factor, cov_diag, eps_skew, log_delta
 
     # -----------------------
@@ -398,6 +399,7 @@ class DeepSSMPatternConditioned(nn.Module):
                 mu_p, logvar_p = self._osc_transition(z, u_t)
                 logvar_p = torch.clamp(logvar_p, -12.0, 6.0)
                 z = self.sample(mu_p, logvar_p)
+                z = torch.clamp(z, -10.0, 10.0)
 
                 if self.emission_uses_u:
                     uh_t, h_u_s = self.u_gru(u_t.unsqueeze(1), h_u_s)
@@ -458,6 +460,7 @@ class DeepSSMPatternConditioned(nn.Module):
                 mu_p, logvar_p = self._osc_transition(z, u_t)
                 logvar_p = torch.clamp(logvar_p, -12.0, 6.0)
                 z = self.sample(mu_p, logvar_p)
+                z = torch.clamp(z, -10.0, 10.0)
 
                 if self.emission_uses_u:
                     uh_t, h_u_s = self.u_gru(u_t.unsqueeze(1), h_u_s)
