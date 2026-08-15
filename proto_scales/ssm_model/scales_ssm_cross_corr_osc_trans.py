@@ -172,7 +172,7 @@ class DeepSSMPatternConditioned(nn.Module):
     def __init__(self, y_dim, u_dim, z_dim=16, rnn_hidden=62, u_rnn_hidden=64, mlp_hidden=128,
                  emission_uses_u=False, use_linear_model=True, reservoir_dim=2,
                  init_alpha=0.01, init_omega=1.0, alpha_max=0.02, cov_rank=5,
-                 osc_damping_max=0.1, osc_freq_range=(2 * math.pi / 240.0, 2 * math.pi / 12.0),
+                 osc_damping_max=0.1, osc_freq_range=(2 * math.pi / 240.0, 2 * math.pi / 24.0),
                  osc_init_damp_ratio=0.05):
         super().__init__()
         if z_dim % 2 != 0:
@@ -200,6 +200,9 @@ class DeepSSMPatternConditioned(nn.Module):
         # Spread ω across the requested range (log-spaced)
         omega_lo, omega_hi = osc_freq_range
         self.omega = nn.Parameter(torch.linspace(omega_lo, omega_hi, self.n_osc))
+        # Learnable per-oscillator amplitude gate; sigmoid(-2.2) ≈ 0.1 so oscillators
+        # start small and must earn their amplitude via the ACF loss.
+        self.log_amp = nn.Parameter(torch.full((self.n_osc,), -2.2))
         # Linear input coupling (B·u_t)
         self.B_osc = nn.Linear(u_dim, z_dim, bias=False)
         # MLP correction on top of linear oscillator
@@ -245,10 +248,11 @@ class DeepSSMPatternConditioned(nn.Module):
         z_pairs = z_prev.reshape(B, self.n_osc, 2)
         damp = torch.sigmoid(self.log_damping) * self.osc_damping_max        # [n_osc]
         decay = torch.exp(-damp)                                             # [n_osc]
+        amp = torch.sigmoid(self.log_amp)                                    # [n_osc]
         cos_w = torch.cos(self.omega)                                        # [n_osc]
         sin_w = torch.sin(self.omega)                                        # [n_osc]
-        z0 = decay * (cos_w * z_pairs[..., 0] - sin_w * z_pairs[..., 1])     # [B, n_osc]
-        z1 = decay * (sin_w * z_pairs[..., 0] + cos_w * z_pairs[..., 1])     # [B, n_osc]
+        z0 = amp * decay * (cos_w * z_pairs[..., 0] - sin_w * z_pairs[..., 1])   # [B, n_osc]
+        z1 = amp * decay * (sin_w * z_pairs[..., 0] + cos_w * z_pairs[..., 1])   # [B, n_osc]
         z_osc = torch.stack([z0, z1], dim=-1).reshape(B, self.z_dim)
         z_input = self.B_osc(u_t)                                            # [B, z_dim]
         corr = self.trans_corr(torch.cat([z_prev, u_t], dim=-1))             # [B, 2·z_dim]
@@ -630,8 +634,21 @@ def run_train(
         reservoir_dim=resevoir_dim, alpha_max=alpha_max, cov_rank=cov_rank,
     ).to(device)
     if weights_file is not None:
-        raw_model.load_state_dict(torch.load(weights_file, map_location=device))
-        print(f"Loaded weights from {weights_file}")
+        ckpt = torch.load(weights_file, map_location=device)
+        missing, unexpected = raw_model.load_state_dict(ckpt, strict=False)
+        if missing:
+            print(f"Warm-start: initialising missing keys {missing}")
+        if unexpected:
+            print(f"Warm-start: ignoring unexpected keys {unexpected}")
+        # Re-initialise oscillator frequencies and amplitude gates so they start
+        # in the correct range rather than carrying over values tuned for the
+        # old (wider) frequency range.
+        omega_lo = 2 * math.pi / 240.0
+        omega_hi = 2 * math.pi / 24.0
+        with torch.no_grad():
+            raw_model.omega.copy_(torch.linspace(omega_lo, omega_hi, raw_model.n_osc))
+            raw_model.log_amp.fill_(-2.2)
+        print(f"Loaded weights from {weights_file} (oscillator params reset to new range)")
     if use_linear_model:
         load_into_ctrl_lin(raw_model, W, b, freeze=True)
 
@@ -693,13 +710,18 @@ def run_train(
             omega = 100 * frac
             gamma = 20000
 
-            if acf_max_lag > 0 and horizon >= 2 * acf_max_lag:
+            # Clip max_lag so the FFT-based ACF is valid: need sequence > 2*lag.
+            # With a typical horizon of 12 months, effective_lag=6 is enough to
+            # penalise a 12-month oscillation via its half-period anticorrelation
+            # (ACF at lag 6 = −1 for a pure annual cycle, 0 for white noise).
+            effective_lag = min(acf_max_lag, (horizon - 1) // 2)
+            if acf_max_lag > 0 and effective_lag >= 2:
                 with torch.no_grad():
                     ctrl_fut = raw_model.ctrl_lin(u_fut.reshape(-1, Du)).reshape(B, horizon, Dy)
-                acf_pred_tas = batch_acf(mean - ctrl_fut, acf_max_lag)
-                acf_true_tas = batch_acf(y_fut - ctrl_fut, acf_max_lag)
-                acf_pred_pr  = batch_acf(mean_pr, acf_max_lag)
-                acf_true_pr  = batch_acf(pr_fut,  acf_max_lag)
+                acf_pred_tas = batch_acf(mean - ctrl_fut, effective_lag)
+                acf_true_tas = batch_acf(y_fut - ctrl_fut, effective_lag)
+                acf_pred_pr  = batch_acf(mean_pr, effective_lag)
+                acf_true_pr  = batch_acf(pr_fut,  effective_lag)
                 acf_loss = (
                     ((acf_pred_tas - acf_true_tas) ** 2).mean()
                     + ((acf_pred_pr - acf_true_pr) ** 2).mean()
