@@ -91,7 +91,7 @@ def model_1000():
     torch.manual_seed(0)
     return build_model(
         y_dim=Y_DIM, u_dim=U_DIM, z_dim=8, rnn_hidden=16, cov_rank=3,
-        context_len=12, horizon=12, cond_dim=32, hidden=32, depth=2, heads=4,
+        context_len=TC, horizon=H, cond_dim=32, hidden=32, depth=2, heads=4,
         n_diffusion_steps=1000, field_memory_rank=8)
 
 
@@ -120,7 +120,7 @@ def test_v_is_better_conditioned_than_eps_at_high_noise():
     """
     torch.manual_seed(0)
     kw = dict(y_dim=Y_DIM, u_dim=U_DIM, z_dim=8, rnn_hidden=16, cov_rank=3,
-              context_len=12, horizon=12, cond_dim=32, hidden=32, depth=2,
+              context_len=TC, horizon=H, cond_dim=32, hidden=32, depth=2,
               heads=4, n_diffusion_steps=1000, field_memory_rank=8)
     mv = build_model(parameterization="v", **kw)
     me = build_model(parameterization="eps", **kw)
@@ -198,3 +198,40 @@ def test_sample_blocks_handles_ragged_horizon(model, batch):
         start_month=3, n_steps=5)
     assert tas.shape == (B, h_long, Y_DIM) and pr.shape == (B, h_long, Y_DIM)
     assert torch.isfinite(tas).all() and torch.isfinite(pr).all()
+
+
+def test_short_context_is_rejected():
+    """Below two years the annual-mean field memory is identically zero."""
+    with pytest.raises(ValueError, match="context_len"):
+        build_model(y_dim=Y_DIM, u_dim=U_DIM, z_dim=8, rnn_hidden=16, cov_rank=3,
+                    context_len=12, horizon=12, cond_dim=32, hidden=32, depth=2,
+                    heads=4, n_diffusion_steps=100, field_memory_rank=8)
+
+
+@pytest.mark.parametrize("freeze", [True, False])
+def test_no_trainable_parameter_is_left_unreduced(freeze):
+    """
+    Every parameter that requires grad must actually receive one, or DDP raises
+    on unreduced parameters. In joint mode this means the SSM's emission head
+    and reservoir - which the DiT replaces - must stay frozen.
+    """
+    torch.manual_seed(0)
+    m = build_model(y_dim=Y_DIM, u_dim=U_DIM, z_dim=8, rnn_hidden=16, cov_rank=3,
+                    context_len=TC, horizon=H, cond_dim=32, hidden=32, depth=2,
+                    heads=4, n_diffusion_steps=100, field_memory_rank=8,
+                    freeze_ssm=freeze)
+    args = (torch.randn(B, TC, Y_DIM), torch.randn(B, TC, Y_DIM), torch.randn(B, TC, U_DIM),
+            torch.randn(B, H, Y_DIM), torch.randn(B, H, Y_DIM), torch.randn(B, H, U_DIM))
+    opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=1e-3)
+    for i in range(4):
+        opt.zero_grad()
+        m.loss(*args).backward()
+        if i < 3:
+            opt.step()
+    bad = [n for n, p in m.named_parameters()
+           if p.requires_grad and (p.grad is None or float(p.grad.abs().sum()) == 0)]
+    assert not bad, f"trainable but unreduced: {bad}"
+    if freeze:
+        assert not m.ssm_encoder.trainable_ssm_parameters()
+    else:
+        assert m.ssm_encoder.trainable_ssm_parameters()

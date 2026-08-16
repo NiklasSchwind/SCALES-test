@@ -26,6 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 
 import proto_scales.ssm_model.scales_ssm as scales_ssm
+import proto_scales.ssm_model.scales_ssm_cross_corr_osc_trans as scales_ssm_osc
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
 from proto_scales.ssm_dit_model.ssm_dit import SSMConditionedOutpaintingDiT
 
@@ -153,6 +154,14 @@ def run_train(
     learnable_timescales=True,
     field_memory_rank=32,
     parameterization="v",
+    # auxiliary SSM objective (end-to-end training)
+    ssm_elbo_weight=0.0,
+    ssm_kl_weight=5.0,
+    ssm_kl_free_bits=0.2,
+    ssm_acf_weight=0.0,
+    ssm_acf_max_lag=120,
+    ssm_rollout_steps=0,
+    ssm_rollout_samples=1,
     # misc
     ema_decay=0.999,
     stride=1,
@@ -249,9 +258,32 @@ def run_train(
         learnable_timescales=learnable_timescales,
         field_memory_rank=field_memory_rank,
         parameterization=parameterization,
+        ssm_elbo_weight=ssm_elbo_weight,
+        ssm_kl_weight=ssm_kl_weight,
+        ssm_kl_free_bits=ssm_kl_free_bits,
+        ssm_acf_weight=ssm_acf_weight,
+        ssm_acf_max_lag=ssm_acf_max_lag,
+        ssm_rollout_steps=ssm_rollout_steps,
+        ssm_rollout_samples=ssm_rollout_samples,
     ).to(device)
     if is_main:
         print(f"[model] diffusion parameterization: {parameterization}")
+        if raw_model.use_ssm_aux:
+            print(f"[model] SSM auxiliary objective ON "
+                  f"(elbo_w={ssm_elbo_weight}, acf_w={ssm_acf_weight})")
+        elif not freeze_ssm:
+            print("[model] WARNING: SSM is trainable but has no auxiliary "
+                  "objective. z is shaped by the diffusion loss alone and the "
+                  "oscillator has no ACF pressure; consider --ssm_elbo_weight.")
+
+    # ctrl_lin is the frozen ridge pattern-scaling term. The SSM's own training
+    # fits and freezes it; the auxiliary ELBO uses it, so do the same here.
+    if raw_model.use_ssm_aux and raw_model.ssm_encoder.ssm.use_linear_model:
+        W, b = scales_ssm_osc.fit_ridge_D(
+            u_n[tr], tas_n[tr], alpha=1e-2, fit_intercept=True)
+        scales_ssm_osc.load_into_ctrl_lin(raw_model.ssm_encoder.ssm, W, b, freeze=True)
+        if is_main:
+            print("[model] ctrl_lin ridge-initialised and frozen")
 
     if weights_file is not None:
         ckpt = torch.load(weights_file, map_location=device)
@@ -306,7 +338,8 @@ def run_train(
             # across the epoch anyway.
             start_month = int(sm[0].item())
 
-            loss = model(tas_c, pr_c, u_c, tas_f, pr_f, u_f, start_month=start_month)
+            loss, parts = model(tas_c, pr_c, u_c, tas_f, pr_f, u_f,
+                                start_month=start_month, return_parts=True)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -318,8 +351,9 @@ def run_train(
             tr_losses.append(loss.item())
             global_step += 1
             if is_main and global_step % 100 == 0:
-                print(f"step {global_step} | loss {np.mean(tr_losses[-100:]):.4f} "
-                      f"| lr {sched.get_last_lr()[0]:.2e}")
+                extra = "".join(f" | {k} {float(v):.4f}" for k, v in parts.items())
+                print(f"step {global_step} | loss {np.mean(tr_losses[-100:]):.4f}"
+                      f"{extra} | lr {sched.get_last_lr()[0]:.2e}")
 
         # ---- validation ----------------------------------------------------
         # Stratified diffusion timesteps rather than random draws: the random-t

@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import proto_scales.ssm_model.scales_ssm_cross_corr_osc_trans as scales_ssm_osc
 from proto_scales.ssm_dit_model.conditioning import ConditioningBuilder, SSMLatentEncoder
 from proto_scales.ssm_dit_model.dit import DiT1D
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
@@ -78,10 +79,27 @@ class SSMConditionedOutpaintingDiT(nn.Module):
         learnable_timescales=True,
         field_memory_rank=32,
         parameterization="v",
+        # auxiliary SSM objective (end-to-end training)
+        ssm_elbo_weight=0.0,
+        ssm_kl_weight=5.0,
+        ssm_kl_free_bits=0.2,
+        ssm_acf_weight=0.0,
+        ssm_acf_max_lag=120,
+        ssm_rollout_steps=0,
+        ssm_rollout_samples=1,
     ):
         super().__init__()
         if parameterization not in ("v", "eps"):
             raise ValueError("parameterization must be 'v' or 'eps'")
+        if int(context_len) < 2 * MONTHS_PER_YEAR:
+            # With fewer than two complete years of context, every month maps to
+            # the zero "year -1" state of the causal annual EMA, so the field
+            # memory is identically zero. Its parameters then receive no
+            # gradient, which also makes DDP raise on unreduced parameters.
+            raise ValueError(
+                f"context_len must be >= {2 * MONTHS_PER_YEAR} months so the "
+                f"annual-mean field memory has at least one completed year to "
+                f"summarise (got {context_len})")
         self.y_dim = y_dim
         self.u_dim = u_dim
         self.context_len = int(context_len)
@@ -94,7 +112,25 @@ class SSMConditionedOutpaintingDiT(nn.Module):
         # DiT for the same fields). See `_to_x0_eps` for the mechanism.
         self.parameterization = parameterization
 
-        self.ssm_encoder = SSMLatentEncoder(ssm, freeze=freeze_ssm)
+        # The auxiliary ELBO is what gives z an objective of its own. Without it,
+        # joint training shapes z purely through the diffusion loss, and nothing
+        # stops the DiT from learning to ignore a z that has drifted into noise —
+        # in particular the oscillator (omega / log_amp / log_damping) has no
+        # pressure at all unless the ACF term is also on.
+        self.ssm_elbo_weight = float(ssm_elbo_weight)
+        self.ssm_kl_weight = float(ssm_kl_weight)
+        self.ssm_kl_free_bits = float(ssm_kl_free_bits)
+        self.ssm_acf_weight = float(ssm_acf_weight)
+        self.ssm_acf_max_lag = int(ssm_acf_max_lag)
+        self.ssm_rollout_steps = int(ssm_rollout_steps)
+        self.ssm_rollout_samples = int(ssm_rollout_samples)
+        self.use_ssm_aux = (not freeze_ssm) and (
+            self.ssm_elbo_weight > 0 or self.ssm_acf_weight > 0)
+        if self.use_ssm_aux and freeze_ssm:
+            raise ValueError("ssm auxiliary losses require freeze_ssm=False")
+
+        self.ssm_encoder = SSMLatentEncoder(
+            ssm, freeze=freeze_ssm, train_emission=self.use_ssm_aux)
         self.cond_builder = ConditioningBuilder(
             y_dim=y_dim,
             u_dim=u_dim,
@@ -188,8 +224,77 @@ class SSMConditionedOutpaintingDiT(nn.Module):
         """
         return self.loss(*args, **kwargs)
 
+    def ssm_aux_loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut):
+        """
+        The SSM's own objective, evaluated inside the DiT forward so it is part
+        of the same DDP reduction.
+
+        Two terms, with different jobs:
+          ELBO  keeps z a genuine latent state of the data rather than whatever
+                the diffusion loss happens to find convenient;
+          ACF   is the only thing that gives the oscillator (omega, log_amp,
+                log_damping) any reason to occupy the ENSO band. Without it the
+                oscillatory inductive bias is nominal.
+
+        Returns (aux_total, parts_dict).
+        """
+        ssm = self.ssm_encoder.ssm
+        device = tas_ctx.device
+        y_full = torch.cat([tas_ctx, tas_fut], dim=1)
+        pr_full = torch.cat([pr_ctx, pr_fut], dim=1)
+        u_full = torch.cat([u_ctx, u_fut], dim=1)
+
+        parts = {}
+        total = torch.zeros((), device=device)
+
+        if self.ssm_elbo_weight > 0:
+            nll, kl, _ = ssm.forward_elbo(
+                y_full, pr_full, u_full, kl_free_bits=self.ssm_kl_free_bits)
+            # Normalise to per-element. forward_elbo sums over time and channels,
+            # so the raw ELBO is O(10^4) against a diffusion loss of O(1) — and,
+            # worse, it rescales whenever T or the number of indicators changes.
+            # Per-element normalisation makes ssm_elbo_weight mean the same thing
+            # across configurations, which is the whole point of training
+            # end-to-end when new indicators are added.
+            T = y_full.shape[1]
+            nll_n = nll / (T * 2 * self.y_dim)
+            kl_n = kl / (T * ssm.z_dim)
+            elbo = nll_n + self.ssm_kl_weight * kl_n
+            total = total + self.ssm_elbo_weight * elbo
+            parts["ssm_nll"] = nll_n.detach()
+            parts["ssm_kl"] = kl_n.detach()
+
+        if self.ssm_acf_weight > 0:
+            R = min(self.ssm_rollout_steps or u_fut.shape[1], u_fut.shape[1])
+            eff_lag = min(self.ssm_acf_max_lag, (R - 1) // 2)
+            if eff_lag >= 2:
+                tas_s, pr_s = ssm.rollout_samples(
+                    tas_ctx, u_ctx, u_fut[:, :R], steps=R,
+                    n_samples=self.ssm_rollout_samples)
+                B, Dy = tas_ctx.shape[0], self.y_dim
+                if ssm.use_linear_model:
+                    with torch.no_grad():
+                        ctrl = ssm.ctrl_lin(
+                            u_fut[:, :R].reshape(-1, self.u_dim)).reshape(B, R, Dy)
+                else:
+                    ctrl = torch.zeros_like(tas_fut[:, :R])
+                acf_true_tas = scales_ssm_osc.batch_acf(tas_fut[:, :R] - ctrl, eff_lag)
+                acf_true_pr = scales_ssm_osc.batch_acf(pr_fut[:, :R], eff_lag)
+                acf = torch.zeros((), device=device)
+                for si in range(tas_s.shape[0]):
+                    acf = acf + (
+                        ((scales_ssm_osc.batch_acf(tas_s[si] - ctrl, eff_lag)
+                          - acf_true_tas) ** 2).mean()
+                        + ((scales_ssm_osc.batch_acf(pr_s[si], eff_lag)
+                            - acf_true_pr) ** 2).mean())
+                acf = acf / tas_s.shape[0]
+                total = total + self.ssm_acf_weight * acf
+                parts["ssm_acf"] = acf.detach()
+
+        return total, parts
+
     def loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut, start_month=0,
-             t_diff=None):
+             t_diff=None, return_parts=False):
         """
         Diffusion loss on the generated positions only, in whichever
         parameterisation the model was built with (v by default).
@@ -229,7 +334,18 @@ class SSMConditionedOutpaintingDiT(nn.Module):
 
         gen = (1.0 - mask)
         denom = gen.sum() * x0.shape[-1]
-        return ((pred - target) ** 2 * gen).sum() / denom.clamp(min=1.0)
+        diff_loss = ((pred - target) ** 2 * gen).sum() / denom.clamp(min=1.0)
+
+        parts = {"diffusion": diff_loss.detach()}
+        total = diff_loss
+        if self.use_ssm_aux:
+            aux, aux_parts = self.ssm_aux_loss(
+                tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut)
+            total = total + aux
+            parts.update(aux_parts)
+            parts["ssm_aux_weighted"] = aux.detach()
+
+        return (total, parts) if return_parts else total
 
     # ------------------------------------------------------------------
     # sampling

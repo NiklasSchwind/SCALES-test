@@ -123,6 +123,18 @@ if __name__ == "__main__":
                    help="SSM checkpoint path. Only use without --ssm_run_dir if the SSM is untrained")
     p.add_argument("--train_ssm", action="store_true",
                    help="Unfreeze the SSM and train it jointly with the DiT")
+    p.add_argument("--end_to_end", action="store_true",
+                   help="Shorthand for --train_ssm with the SSM's own ELBO and ACF losses enabled. Recommended over bare --train_ssm: without them z is shaped by the diffusion loss alone and the oscillator gets no ACF pressure")
+    p.add_argument("--ssm_elbo_weight", type=float, default=1.0,
+                   help="Weight on the SSM ELBO when training end-to-end (0 disables). The ELBO is normalised per-element, so this is on the same scale as the diffusion loss and does not need rescaling when indicators are added")
+    p.add_argument("--ssm_kl_weight", type=float, default=5.0)
+    p.add_argument("--ssm_kl_free_bits", type=float, default=0.2)
+    p.add_argument("--ssm_acf_weight", type=float, default=10.0,
+                   help="Weight on the SSM ACF loss when training end-to-end (0 disables). NOTE: not comparable to the 5000 used in train_scales_ssm_cross_corr.py, which competes with a raw summed NLL of order 1e5; here it competes with an O(1) diffusion loss")
+    p.add_argument("--ssm_acf_max_lag", type=int, default=120)
+    p.add_argument("--ssm_rollout_steps", type=int, default=0,
+                   help="Differentiable rollout length for the ACF term; 0 uses the full horizon")
+    p.add_argument("--ssm_rollout_samples", type=int, default=1)
     p.add_argument("--z_dim", type=int, default=64)
     p.add_argument("--rnn_hidden", type=int, default=256)
     p.add_argument("--cov_rank", type=int, default=8)
@@ -192,7 +204,14 @@ if __name__ == "__main__":
             batch_size=args.batch_size, epochs=args.epochs, lr=args.lr,
             weight_decay=args.weight_decay, warmup_steps=args.warmup_steps,
             ssm_weights=ssm_weights, ssm_run_dir=args.ssm_run_dir,
-            freeze_ssm=not args.train_ssm,
+            freeze_ssm=not (args.train_ssm or args.end_to_end),
+            ssm_elbo_weight=args.ssm_elbo_weight if args.end_to_end else 0.0,
+            ssm_kl_weight=args.ssm_kl_weight,
+            ssm_kl_free_bits=args.ssm_kl_free_bits,
+            ssm_acf_weight=args.ssm_acf_weight if args.end_to_end else 0.0,
+            ssm_acf_max_lag=args.ssm_acf_max_lag,
+            ssm_rollout_steps=args.ssm_rollout_steps,
+            ssm_rollout_samples=args.ssm_rollout_samples,
             z_dim=args.z_dim, rnn_hidden=args.rnn_hidden, cov_rank=args.cov_rank,
             cond_dim=args.cond_dim, hidden=args.hidden, depth=args.depth,
             heads=args.heads, n_diffusion_steps=args.n_diffusion_steps,

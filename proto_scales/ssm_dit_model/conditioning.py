@@ -52,14 +52,36 @@ class SSMLatentEncoder(nn.Module):
              constant once the DiT can explain the data on its own.
     """
 
-    def __init__(self, ssm, freeze=True):
+    # SSM components the DiT does not use: the emission head, the pattern-scaling
+    # term and the slow reservoir are all replaced by the DiT and the memory
+    # kernels. Only the inference GRU, q_head and the oscillatory transition are
+    # on the path from z to the loss.
+    UNUSED_PREFIXES = ("emit.", "ctrl_lin.", "u_gru.", "omega_lin.", "log_alpha")
+
+    def __init__(self, ssm, freeze=True, train_emission=False):
         super().__init__()
         self.ssm = ssm
         self.z_dim = ssm.z_dim
         self.frozen = bool(freeze)
+        self.train_emission = bool(train_emission)
         if self.frozen:
             for p in self.ssm.parameters():
                 p.requires_grad = False
+        elif not self.train_emission:
+            # Freeze the unused components in joint-training mode. They receive
+            # no gradient from the diffusion loss, and DDP raises on parameters
+            # that require grad but are never reduced. Semantically they are
+            # also undefined here: without the SSM's own ELBO there is no
+            # objective that would train them.
+            for name, p in self.ssm.named_parameters():
+                if name.startswith(self.UNUSED_PREFIXES):
+                    p.requires_grad = False
+        # else: the auxiliary ELBO is active, so the emission head and reservoir
+        # do have an objective and stay trainable. `ctrl_lin` is handled
+        # separately (ridge-initialised and frozen, as in SSM training).
+
+    def trainable_ssm_parameters(self):
+        return [n for n, p in self.ssm.named_parameters() if p.requires_grad]
 
     def train(self, mode=True):
         super().train(mode)
