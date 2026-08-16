@@ -45,6 +45,8 @@ if __name__ == "__main__":
     parser.add_argument("--weights_file", type=str, default=None, help="Path to existing model weights file to initialise training from (must match cross-corr architecture)")
     parser.add_argument("--acf_max_lag", type=int, default=120, help="Max lag (months) for ACF loss; 0 disables it")
     parser.add_argument("--acf_weight", type=float, default=5000.0, help="Weight for ACF loss term")
+    parser.add_argument("--rollout_steps", type=int, default=120, help="Length (months) of the differentiable rollout used for the rollout-MSE and ACF losses; caps the longest resolvable ACF lag at (rollout_steps-1)//2")
+    parser.add_argument("--rollout_samples", type=int, default=1, help="Samples per differentiable rollout; memory scales linearly")
 
     args = parser.parse_args()
 
@@ -128,12 +130,15 @@ if __name__ == "__main__":
         f.write(f"cov_rank={args.cov_rank}\n")
         f.write(f"acf_max_lag={args.acf_max_lag}\n")
         f.write(f"acf_weight={args.acf_weight}\n")
+        f.write(f"rollout_steps={args.rollout_steps}\n")
+        f.write(f"rollout_samples={args.rollout_samples}\n")
 
     try:
         model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=600, z_dim=64,rnn_hidden=256,horizon=1200,
             use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=args.alpha_max, resevoir_dim=args.reservoir,
             cov_rank=args.cov_rank, run_dir=run_dir, weights_file=args.weights_file,
-            acf_max_lag=args.acf_max_lag, acf_weight=args.acf_weight)
+            acf_max_lag=args.acf_max_lag, acf_weight=args.acf_weight,
+            rollout_steps=args.rollout_steps, rollout_samples=args.rollout_samples)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()

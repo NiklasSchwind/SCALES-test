@@ -36,12 +36,19 @@ Improvements vs. the original module
    modes in the latent state — the mechanism that was missing to represent
    ENSO-like internal variability.
 
-3. Rebalanced training loss
-   -------------------------
-   The rollout-MSE weights (`alpha`, `omega`, `gamma`) that overwhelmed the
-   ELBO in the original are reduced by ~5×, so the joint NLL and KL carry
-   meaningful gradient signal. This is a `run_train` internal change; the
-   function signature is unchanged.
+3. Differentiable rollout for the auxiliary losses
+   ------------------------------------------------
+   The rollout-MSE and ACF terms were previously computed from
+   `forecast_deterministic`, which is decorated `@torch.no_grad()`. They were
+   therefore constants and contributed exactly zero gradient — the effective
+   training objective was `nll + kl_w * kl` alone. `rollout_samples` is the
+   trainable counterpart (reparameterised `rsample`, per-sample trajectories),
+   and `run_train` now evaluates the auxiliary terms on a shorter
+   `rollout_steps` window that fits in memory with the graph retained.
+
+   The ACF loss is also now evaluated per realisation rather than on the
+   ensemble mean, since the ACF of an ensemble mean measures the forced signal,
+   not the internal variability the term is meant to constrain.
 
 Public API
 ----------
@@ -490,6 +497,82 @@ class DeepSSMPatternConditioned(nn.Module):
         return (samp.mean(0), samp.quantile(0.10, 0), samp.quantile(0.90, 0),
                 samp_pr.mean(0), samp_pr.quantile(0.10, 0), samp_pr.quantile(0.90, 0))
 
+    # -----------------------
+    # Differentiable rollout (training-time auxiliary losses)
+    # -----------------------
+    def rollout_samples(self, y_ctx, u_ctx, u_fut, steps, n_samples=1):
+        """
+        Prior rollout that KEEPS the autograd graph.
+
+        `forecast` and `forecast_deterministic` are both decorated
+        `@torch.no_grad()` because they are inference entry points. Using them
+        inside a training loss silently produces a constant: the rollout-MSE
+        and ACF terms then contribute exactly zero gradient. This method is the
+        trainable counterpart.
+
+        It returns the individual sample trajectories rather than their mean,
+        because the two auxiliary losses need different things:
+          - rollout MSE wants the ensemble mean (an estimator of the forced
+            response),
+          - the ACF loss must be evaluated per realisation — the ACF of an
+            ensemble *mean* is not the ACF of the process, it is the ACF of the
+            forced signal, so averaging first defeats the purpose of the term.
+
+        Emission draws use `rsample` (reparameterised); `sample` would detach.
+
+        Returns (tas, pr), each [n_samples, B, steps, y_dim].
+        """
+        B = y_ctx.shape[0]
+
+        rnn_in = torch.cat([y_ctx, u_ctx], dim=-1)
+        h, _ = self.gru(rnn_in)
+        q_params = self.q_head(h[:, -1:])
+        mu_qT, logvar_qT = torch.chunk(q_params.squeeze(1), 2, dim=-1)
+        logvar_qT = torch.clamp(logvar_qT, -12.0, 6.0)
+
+        if self.emission_uses_u:
+            uh_ctx, h_u = self.u_gru(u_ctx)
+            s_ctx = torch.zeros(B, self.y_dim, self.reservoir_dim, device=u_ctx.device)
+            for k in range(u_ctx.shape[1]):
+                s_ctx = self._reservoir_step(s_ctx, uh_ctx[:, k])
+
+        samps_tas = []
+        samps_pr = []
+        for _ in range(n_samples):
+            z = self.sample(mu_qT, logvar_qT)
+            h_u_s = h_u.clone() if self.emission_uses_u else None
+            s = s_ctx.clone() if self.emission_uses_u else None
+
+            preds_tas = []
+            preds_pr = []
+            for k in range(steps):
+                u_t = u_fut[:, k]
+                mu_p, logvar_p = self._osc_transition(z, u_t)
+                logvar_p = torch.clamp(logvar_p, -12.0, 6.0)
+                z = self.sample(mu_p, logvar_p)
+                z = torch.clamp(z, -10.0, 10.0)
+
+                if self.emission_uses_u:
+                    uh_t, h_u_s = self.u_gru(u_t.unsqueeze(1), h_u_s)
+                    uh_t = uh_t.squeeze(1)
+                    e_in = torch.cat([z, uh_t, s.reshape(B, -1)], dim=-1)
+                    s = self._reservoir_step(s, uh_t)
+                else:
+                    e_in = z
+
+                mu_x, cov_factor, cov_diag, eps_skew, log_delta = self._emit_step(e_in, u_t, B)
+                dist_joint = torch.distributions.LowRankMultivariateNormal(
+                    loc=mu_x, cov_factor=cov_factor, cov_diag=cov_diag)
+                x_samp = dist_joint.rsample()
+                preds_tas.append(x_samp[:, :self.y_dim])
+                preds_pr.append(sinh_arcsinh_forward(
+                    x_samp[:, self.y_dim:], eps_skew, log_delta, eps=self.eps))
+
+            samps_tas.append(torch.stack(preds_tas, dim=1))
+            samps_pr.append(torch.stack(preds_pr, dim=1))
+
+        return torch.stack(samps_tas, dim=0), torch.stack(samps_pr, dim=0)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities (unchanged from original)
@@ -581,6 +664,8 @@ def run_train(
     weights_file=None,
     acf_max_lag=120,
     acf_weight=5000.0,
+    rollout_steps=120,
+    rollout_samples=1,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     use_cuda = torch.cuda.is_available()
@@ -683,26 +768,41 @@ def run_train(
             B, T, _ = y_full.shape
 
             nll, kl, nll_pr = raw_model.forward_elbo(y_full, pr_full, u_full, kl_free_bits=0.2)
-            mean, _, _, mean_pr, _, _ = raw_model.forecast_deterministic(
-                y_ctx, u_ctx, u_fut, steps=horizon, n_samples=30)
-            roll_out_mse = F.huber_loss(mean, y_fut, delta=1.0)
-            roll_out_mse_pr = F.huber_loss(mean_pr, pr_fut, delta=1.0)
+
+            # Differentiable prior rollout. The previous code called
+            # forecast_deterministic (@torch.no_grad), so every term below
+            # contributed zero gradient — the effective objective was nll+kl_w*kl.
+            # A full `horizon`-step differentiable rollout does not fit in memory,
+            # so the auxiliary losses are evaluated on the first `rollout_steps`.
+            R = min(int(rollout_steps), horizon)
+            tas_s, pr_s = raw_model.rollout_samples(
+                y_ctx, u_ctx, u_fut[:, :R], steps=R, n_samples=rollout_samples)
+            y_fut_R = y_fut[:, :R]
+            pr_fut_R = pr_fut[:, :R]
+
+            mean = tas_s.mean(0)
+            mean_pr = pr_s.mean(0)
+            roll_out_mse = F.huber_loss(mean, y_fut_R, delta=1.0)
+            roll_out_mse_pr = F.huber_loss(mean_pr, pr_fut_R, delta=1.0)
             if use_linear_model:
                 lin_mean = raw_model.ctrl_lin(u_full.reshape(-1, Du)).reshape(B, T, Dy)
                 lin_mse = ((lin_mean - y_full) ** 2).mean()
 
-            n_complete_years = horizon // 12
+            n_complete_years = R // 12
             if n_complete_years > 0:
                 H_yr = n_complete_years * 12
                 mean_yr = mean[:, :H_yr, :].reshape(B, n_complete_years, 12, Dy).mean(dim=2)
-                y_fut_yr = y_fut[:, :H_yr, :].reshape(B, n_complete_years, 12, Dy).mean(dim=2)
+                y_fut_yr = y_fut_R[:, :H_yr, :].reshape(B, n_complete_years, 12, Dy).mean(dim=2)
                 roll_out_mse_yearly = ((mean_yr - y_fut_yr) ** 2).mean()
             else:
                 roll_out_mse_yearly = torch.tensor(0.0, device=device)
 
-            # Loss rebalance (improvement 3): reduce rollout/yearly weights so the
-            # joint ELBO carries meaningful gradient signal. Original values were
-            # alpha=10000, omega=500, gamma=80000.
+            # NOTE: until the rollout was made differentiable these weights were
+            # inert (see rollout_samples). They are kept at their previous values
+            # as a starting point only — retune against the printed weighted
+            # contributions below. Watch for variance collapse: alpha/gamma pull
+            # the ensemble mean onto a single realisation, which the NLL and ACF
+            # terms have to push back against.
             global_step += 1
             frac = min(1.0, global_step / int(0.3 * total_steps))
             kl_w = 5
@@ -711,21 +811,28 @@ def run_train(
             gamma = 20000
 
             # Clip max_lag so the FFT-based ACF is valid: need sequence > 2*lag.
-            # With a typical horizon of 12 months, effective_lag=6 is enough to
-            # penalise a 12-month oscillation via its half-period anticorrelation
-            # (ACF at lag 6 = −1 for a pure annual cycle, 0 for white noise).
-            effective_lag = min(acf_max_lag, (horizon - 1) // 2)
+            # The rollout length R therefore caps which periods can be penalised:
+            # only oscillations with a half-period below effective_lag are visible.
+            effective_lag = min(acf_max_lag, (R - 1) // 2)
             if acf_max_lag > 0 and effective_lag >= 2:
-                with torch.no_grad():
-                    ctrl_fut = raw_model.ctrl_lin(u_fut.reshape(-1, Du)).reshape(B, horizon, Dy)
-                acf_pred_tas = batch_acf(mean - ctrl_fut, effective_lag)
-                acf_true_tas = batch_acf(y_fut - ctrl_fut, effective_lag)
-                acf_pred_pr  = batch_acf(mean_pr, effective_lag)
-                acf_true_pr  = batch_acf(pr_fut,  effective_lag)
-                acf_loss = (
-                    ((acf_pred_tas - acf_true_tas) ** 2).mean()
-                    + ((acf_pred_pr - acf_true_pr) ** 2).mean()
-                )
+                if use_linear_model:
+                    with torch.no_grad():
+                        ctrl_fut = raw_model.ctrl_lin(
+                            u_fut[:, :R].reshape(-1, Du)).reshape(B, R, Dy)
+                else:
+                    ctrl_fut = torch.zeros_like(y_fut_R)
+                acf_true_tas = batch_acf(y_fut_R - ctrl_fut, effective_lag)
+                acf_true_pr = batch_acf(pr_fut_R, effective_lag)
+                # Per realisation, not on the ensemble mean: averaging samples
+                # first would remove exactly the internal variability whose
+                # autocorrelation this term is meant to constrain.
+                acf_loss = torch.zeros((), device=device)
+                for si in range(tas_s.shape[0]):
+                    acf_loss = acf_loss + (
+                        ((batch_acf(tas_s[si] - ctrl_fut, effective_lag) - acf_true_tas) ** 2).mean()
+                        + ((batch_acf(pr_s[si], effective_lag) - acf_true_pr) ** 2).mean()
+                    )
+                acf_loss = acf_loss / tas_s.shape[0]
             else:
                 acf_loss = torch.tensor(0.0, device=device)
 
@@ -734,14 +841,20 @@ def run_train(
                     + gamma * roll_out_mse_yearly + acf_weight * frac * acf_loss)
 
             if global_step % 100 == 0:
-                if use_linear_model:
-                    print("loss: ", nll.item(), kl_w, kl.item(), roll_out_mse.item(),
-                          lin_mse.item(), nll_pr.item(), roll_out_mse_pr.item(),
-                          roll_out_mse_yearly.item(), acf_loss.item())
-                else:
-                    print("loss: ", nll.item(), kl_w, kl.item(), roll_out_mse.item(),
-                          nll_pr.item(), roll_out_mse_pr.item(),
-                          roll_out_mse_yearly.item(), acf_loss.item())
+                # Weighted contributions, so the balance between the ELBO and the
+                # auxiliary terms is directly readable. These terms only started
+                # carrying gradient once the rollout became differentiable, so
+                # their weights have never actually been tuned against the ELBO.
+                print(
+                    f"step {global_step} | nll {nll.item():.1f} "
+                    f"| kl {kl_w * kl.item():.1f} "
+                    f"| roll {alpha * roll_out_mse.item():.1f} "
+                    f"| roll_pr {omega * roll_out_mse_pr.item():.1f} "
+                    f"| yearly {gamma * roll_out_mse_yearly.item():.1f} "
+                    f"| acf {acf_weight * frac * acf_loss.item():.1f} "
+                    f"| (raw acf {acf_loss.item():.4f})"
+                    + (f" | lin_mse {lin_mse.item():.4f}" if use_linear_model else "")
+                )
 
             opt.zero_grad()
             loss.backward()
