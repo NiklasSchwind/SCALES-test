@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import proto_scales.ssm_model.scales_ssm as scales_ssm
 import proto_scales.ssm_model.scales_ssm_cross_corr_osc_trans as scales_ssm_osc
+from proto_scales.ssm_dit_model.annual_ssm import AnnualSSM
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
 from proto_scales.ssm_dit_model.ssm_dit import SSMConditionedOutpaintingDiT
 
@@ -162,6 +163,13 @@ def run_train(
     ssm_acf_max_lag=120,
     ssm_rollout_steps=0,
     ssm_rollout_samples=1,
+    # annual SSM
+    use_annual_ssm=False,
+    annual_z_dim=16,
+    annual_rnn_hidden=64,
+    annual_emit_hidden=0,
+    annual_trans_hidden=0,
+    annual_osc_period_range=(2.0, 20.0),
     # misc
     ema_decay=0.999,
     stride=1,
@@ -233,11 +241,19 @@ def run_train(
     Dy = tas_np.shape[-1]
     Du = u_np.shape[-1]
 
-    import proto_scales.ssm_model.scales_ssm_cross_corr_osc_trans as ssm_mod
-    ssm = ssm_mod.DeepSSMPatternConditioned(
-        y_dim=Dy, u_dim=Du, z_dim=z_dim, rnn_hidden=rnn_hidden,
-        emission_uses_u=True, use_linear_model=True, cov_rank=cov_rank,
-    )
+    if use_annual_ssm:
+        ssm = AnnualSSM(
+            obs_dim=2 * Dy, u_dim=Du, z_dim=annual_z_dim,
+            rnn_hidden=annual_rnn_hidden, emit_hidden=annual_emit_hidden,
+            trans_hidden=annual_trans_hidden,
+            osc_period_range=annual_osc_period_range,
+        )
+    else:
+        import proto_scales.ssm_model.scales_ssm_cross_corr_osc_trans as ssm_mod
+        ssm = ssm_mod.DeepSSMPatternConditioned(
+            y_dim=Dy, u_dim=Du, z_dim=z_dim, rnn_hidden=rnn_hidden,
+            emission_uses_u=True, use_linear_model=True, cov_rank=cov_rank,
+        )
     if ssm_weights is not None:
         ckpt = torch.load(ssm_weights, map_location="cpu")
         missing, unexpected = ssm.load_state_dict(ckpt, strict=False)
@@ -326,6 +342,7 @@ def run_train(
     best_val = float("inf")
     best_state = None
     global_step = 0
+    n_skipped = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -341,9 +358,32 @@ def run_train(
             loss, parts = model(tas_c, pr_c, u_c, tas_f, pr_f, u_f,
                                 start_month=start_month, return_parts=True)
 
+            # A single non-finite loss is enough to destroy a run: the NaN
+            # reaches every gradient, the optimiser writes NaN into the weights,
+            # and from then on every forward pass produces NaN. The failure is
+            # then reported far from its cause. Skip the step instead.
+            if not torch.isfinite(loss):
+                n_skipped += 1
+                if is_main and n_skipped <= 10:
+                    bad = [k for k, v in parts.items() if not torch.isfinite(v)]
+                    print(f"[warn] step {global_step}: non-finite loss, skipping. "
+                          f"offending terms: {bad or 'total only'}")
+                opt.zero_grad(set_to_none=True)
+                global_step += 1
+                continue
+
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(params, grad_clip)
+            gnorm = nn.utils.clip_grad_norm_(params, grad_clip)
+            if not torch.isfinite(gnorm):
+                # Gradients can be non-finite even when the loss is finite.
+                n_skipped += 1
+                if is_main and n_skipped <= 10:
+                    print(f"[warn] step {global_step}: non-finite grad norm, skipping")
+                opt.zero_grad(set_to_none=True)
+                global_step += 1
+                continue
+
             opt.step()
             sched.step()
             ema.update(raw_model)
@@ -370,10 +410,15 @@ def run_train(
                     tas_c, pr_c, u_c, tas_f, pr_f, u_f,
                     start_month=int(sm[0].item()), t_diff=t_strat).item())
 
-        tr_mean = float(np.mean(tr_losses)) if tr_losses else float("nan")
+        if not tr_losses:
+            raise RuntimeError(
+                f"epoch {epoch}: every step was skipped as non-finite. The model "
+                f"has diverged; lower --lr or --ssm_elbo_weight.")
+        tr_mean = float(np.mean(tr_losses))
         va_mean = float(np.mean(va_losses)) if va_losses else float("nan")
         if is_main:
-            print(f"epoch {epoch:03d} | train {tr_mean:.4f} | val {va_mean:.4f}")
+            skip_note = f" | skipped {n_skipped}" if n_skipped else ""
+            print(f"epoch {epoch:03d} | train {tr_mean:.4f} | val {va_mean:.4f}{skip_note}")
 
         if va_mean < best_val - 1e-5:
             best_val = va_mean

@@ -235,3 +235,128 @@ def test_no_trainable_parameter_is_left_unreduced(freeze):
         assert not m.ssm_encoder.trainable_ssm_parameters()
     else:
         assert m.ssm_encoder.trainable_ssm_parameters()
+
+
+# ------------------------------------------------------------- numerical safety
+@pytest.mark.parametrize("log_delta_bias", [-12.0, 12.0])
+def test_sas_flow_cannot_overflow(log_delta_bias):
+    """
+    Regression: sinh() overflows float32 at ~89, and the SAS map divides by
+    delta = softplus(log_delta). With log_delta unbounded, drift in either
+    direction produced inf -> NaN in the ACF loss -> NaN gradients -> NaN
+    weights, surfacing only later as "invalid values" in the emission
+    LowRankMultivariateNormal loc.
+    """
+    import proto_scales.ssm_model.scales_ssm_cross_corr_osc_trans as sm
+    torch.manual_seed(0)
+    D = 6
+    ssm = sm.DeepSSMPatternConditioned(
+        y_dim=D, u_dim=1, z_dim=8, rnn_hidden=16,
+        emission_uses_u=True, use_linear_model=True, cov_rank=3)
+    with torch.no_grad():
+        ssm.emit.net[-1].bias[-D:] = log_delta_bias  # the log_delta slice
+
+    b, tc, h = 4, 24, 24
+    tas_c, pr_c = torch.randn(b, tc, D), torch.randn(b, tc, D)
+    u_c, u_f = torch.randn(b, tc, 1), torch.randn(b, h, 1)
+
+    tas_s, pr_s = ssm.rollout_samples(tas_c, u_c, u_f, steps=h, n_samples=1)
+    assert torch.isfinite(pr_s).all(), "SAS forward map overflowed"
+
+    loss = ((sm.batch_acf(pr_s[0], 8) - sm.batch_acf(torch.randn(b, h, D), 8)) ** 2).mean()
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(ssm.emit.net[-1].bias.grad).all(), "NaN gradient"
+
+    nll, kl, _ = ssm.forward_elbo(
+        torch.cat([tas_c, torch.randn(b, h, D)], 1),
+        torch.cat([pr_c, torch.randn(b, h, D)], 1),
+        torch.cat([u_c, u_f], 1))
+    assert torch.isfinite(nll) and torch.isfinite(kl), "ELBO inverse map overflowed"
+
+
+# ------------------------------------------------------------------ annual SSM
+def test_to_annual_and_broadcast_alignment():
+    from proto_scales.ssm_dit_model import broadcast_to_monthly, to_annual
+    a = to_annual(torch.arange(24., dtype=torch.float32).reshape(1, 24, 1))
+    assert torch.allclose(a.flatten(), torch.tensor([5.5, 17.5]))
+    # trailing partial year is averaged over the months present, not dropped
+    a2 = to_annual(torch.arange(30., dtype=torch.float32).reshape(1, 30, 1))
+    assert a2.shape[1] == 3 and abs(float(a2[0, 2, 0]) - 26.5) < 1e-4
+    z = torch.tensor([[[0.], [1.], [2.]]])
+    b = broadcast_to_monthly(z, 30).flatten()
+    assert b[11] == 0 and b[12] == 1 and b[23] == 1 and b[24] == 2 and b[29] == 2
+
+
+def test_annual_elbo_is_scale_invariant():
+    """
+    Per-element normalisation is what makes kl_weight portable across
+    configurations - including after adding indicators.
+    """
+    from proto_scales.ssm_dit_model import AnnualSSM
+    vals = []
+    for d, yrs, z in [(6, 40, 8), (30, 40, 8), (6, 120, 8), (6, 40, 32)]:
+        torch.manual_seed(0)
+        m = AnnualSSM(obs_dim=2 * d, u_dim=1, z_dim=z, rnn_hidden=16)
+        nll, _ = m.forward_elbo(torch.randn(3, yrs, 2 * d), torch.randn(3, yrs, 1))
+        vals.append(float(nll))
+    assert max(vals) / min(vals) < 1.5, f"nll not scale invariant: {vals}"
+
+
+def test_annual_transition_is_stable_by_construction():
+    """Rotation scaled by exp(-damping) => every eigenvalue inside the unit circle."""
+    from proto_scales.ssm_dit_model import AnnualSSM
+    torch.manual_seed(0)
+    m = AnnualSSM(obs_dim=8, u_dim=1, z_dim=8, rnn_hidden=16)
+    z = torch.randn(1, 8) * 5.0
+    n0 = float(z.norm())
+    for _ in range(400):
+        z, _ = m.transition(z, torch.zeros(1, 1))
+    assert float(z.norm()) < n0
+
+
+def test_annual_ssm_rejects_sub_nyquist_period():
+    from proto_scales.ssm_dit_model import AnnualSSM
+    with pytest.raises(ValueError, match="Nyquist"):
+        AnnualSSM(obs_dim=8, u_dim=1, z_dim=8, osc_period_range=(0.5, 20.0))
+
+
+@pytest.mark.parametrize("freeze", [True, False])
+def test_annual_ssm_drops_into_dit(freeze):
+    from proto_scales.ssm_dit_model import AnnualSSM
+    from proto_scales.ssm_dit_model.ssm_dit import SSMConditionedOutpaintingDiT
+    torch.manual_seed(0)
+    ssm = AnnualSSM(obs_dim=2 * Y_DIM, u_dim=U_DIM, z_dim=8, rnn_hidden=16)
+    m = SSMConditionedOutpaintingDiT(
+        ssm=ssm, y_dim=Y_DIM, u_dim=U_DIM, context_len=TC, horizon=H,
+        freeze_ssm=freeze, cond_dim=32, hidden=32, depth=2, heads=4,
+        n_diffusion_steps=100, field_memory_rank=8,
+        ssm_elbo_weight=0.0 if freeze else 1.0, ssm_acf_weight=0.0)
+    assert m.annual_ssm
+    args = (torch.randn(B, TC, Y_DIM), torch.randn(B, TC, Y_DIM), torch.randn(B, TC, U_DIM),
+            torch.randn(B, H, Y_DIM), torch.randn(B, H, Y_DIM), torch.randn(B, H, U_DIM))
+    opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=1e-3)
+    for i in range(4):
+        opt.zero_grad()
+        m.loss(*args).backward()
+        if i < 3:
+            opt.step()
+    bad = [n for n, p in m.named_parameters()
+           if p.requires_grad and (p.grad is None or float(p.grad.abs().sum()) == 0)]
+    assert not bad, f"trainable but unreduced: {bad}"
+    m.eval()
+    tas, _ = m.sample(args[0], args[1], args[2], args[5], start_month=0, n_steps=5)
+    assert torch.isfinite(tas).all()
+
+
+def test_annual_ssm_rejects_acf_weight():
+    """The AnnualSSM has no ACF term; asking for one is a configuration error."""
+    from proto_scales.ssm_dit_model import AnnualSSM
+    from proto_scales.ssm_dit_model.ssm_dit import SSMConditionedOutpaintingDiT
+    ssm = AnnualSSM(obs_dim=2 * Y_DIM, u_dim=U_DIM, z_dim=8, rnn_hidden=16)
+    with pytest.raises(ValueError, match="ELBO alone"):
+        SSMConditionedOutpaintingDiT(
+            ssm=ssm, y_dim=Y_DIM, u_dim=U_DIM, context_len=TC, horizon=H,
+            freeze_ssm=False, cond_dim=32, hidden=32, depth=2, heads=4,
+            n_diffusion_steps=100, field_memory_rank=8,
+            ssm_elbo_weight=1.0, ssm_acf_weight=10.0)

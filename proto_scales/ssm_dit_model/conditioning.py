@@ -115,12 +115,17 @@ class SSMLatentEncoder(nn.Module):
             out.append(z)
         return torch.stack(out, dim=1)
 
-    def forward(self, y_ctx, u_ctx, u_fut, stochastic=True):
+    def forward(self, y_ctx, pr_ctx, u_ctx, u_fut, stochastic=True):
         """
         Returns z over the whole window, [B, Tc + H, z_dim].
 
         Posterior over the context, prior rollout over the future — see the
         module docstring on why the future half must not use the posterior.
+
+        `pr_ctx` is accepted but unused: this SSM's inference GRU was built to
+        see tas and u only. It is in the signature so that this class and
+        `annual_ssm.AnnualSSMLatentEncoder` — which does use pr — are
+        interchangeable from the DiT's point of view.
         """
         ctx = torch.enable_grad() if not self.frozen else torch.no_grad()
         with ctx:

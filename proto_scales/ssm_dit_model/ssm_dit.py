@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import proto_scales.ssm_model.scales_ssm_cross_corr_osc_trans as scales_ssm_osc
+from proto_scales.ssm_dit_model.annual_ssm import AnnualSSM, AnnualSSMLatentEncoder
 from proto_scales.ssm_dit_model.conditioning import ConditioningBuilder, SSMLatentEncoder
 from proto_scales.ssm_dit_model.dit import DiT1D
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
@@ -129,8 +130,18 @@ class SSMConditionedOutpaintingDiT(nn.Module):
         if self.use_ssm_aux and freeze_ssm:
             raise ValueError("ssm auxiliary losses require freeze_ssm=False")
 
-        self.ssm_encoder = SSMLatentEncoder(
-            ssm, freeze=freeze_ssm, train_emission=self.use_ssm_aux)
+        # The two SSMs expose the same encoder interface, so everything
+        # downstream (ConditioningBuilder, DiT1D, sampling) is identical.
+        self.annual_ssm = isinstance(ssm, AnnualSSM)
+        if self.annual_ssm:
+            if self.ssm_acf_weight > 0:
+                raise ValueError(
+                    "AnnualSSM is trained with the ELBO alone; there is no ACF "
+                    "term. Set ssm_acf_weight=0.")
+            self.ssm_encoder = AnnualSSMLatentEncoder(ssm, freeze=freeze_ssm)
+        else:
+            self.ssm_encoder = SSMLatentEncoder(
+                ssm, freeze=freeze_ssm, train_emission=self.use_ssm_aux)
         self.cond_builder = ConditioningBuilder(
             y_dim=y_dim,
             u_dim=u_dim,
@@ -165,7 +176,7 @@ class SSMConditionedOutpaintingDiT(nn.Module):
                            stochastic_z=True):
         """Returns (cond [B, T_tot, cond_dim], field_ctx [B, Tc, 2*y_dim])."""
         field_ctx = torch.cat([tas_ctx, pr_ctx], dim=-1)
-        z = self.ssm_encoder(tas_ctx, u_ctx, u_fut, stochastic=stochastic_z)
+        z = self.ssm_encoder(tas_ctx, pr_ctx, u_ctx, u_fut, stochastic=stochastic_z)
         u_full = torch.cat([u_ctx, u_fut], dim=1)
         cond = self.cond_builder(
             z=z,
@@ -238,8 +249,17 @@ class SSMConditionedOutpaintingDiT(nn.Module):
 
         Returns (aux_total, parts_dict).
         """
-        ssm = self.ssm_encoder.ssm
         device = tas_ctx.device
+        if self.annual_ssm:
+            # ELBO only, already normalised per element by AnnualSSM.
+            nll, kl = self.ssm_encoder.elbo(
+                tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut,
+                kl_free_bits=self.ssm_kl_free_bits)
+            elbo = nll + self.ssm_kl_weight * kl
+            return (self.ssm_elbo_weight * elbo,
+                    {"ssm_nll": nll.detach(), "ssm_kl": kl.detach()})
+
+        ssm = self.ssm_encoder.ssm
         y_full = torch.cat([tas_ctx, tas_fut], dim=1)
         pr_full = torch.cat([pr_ctx, pr_fut], dim=1)
         u_full = torch.cat([u_ctx, u_fut], dim=1)

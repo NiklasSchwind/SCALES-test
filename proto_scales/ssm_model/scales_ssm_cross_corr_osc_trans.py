@@ -84,12 +84,35 @@ import proto_scales.ssm_model.scales_ssm as scales_ssm
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sinh–arcsinh flow (kept for legacy callers; joint model uses inline versions)
+#
+# Numerical safety
+# ----------------
+# sinh() overflows float32 at an argument of ~89, and the SAS forward map is
+# sinh((asinh(x) + eps_skew) / delta) with delta = softplus(log_delta). Nothing
+# in the network bounds log_delta, so if it drifts negative during training
+# delta collapses toward 0, the argument explodes and the map returns inf. That
+# inf then reaches the ACF loss as NaN, the NaN reaches the gradients, and the
+# optimiser writes NaN into every emission weight — after which the *next*
+# forward pass fails with "invalid values" in the LowRankMultivariateNormal loc,
+# several steps downstream of the actual cause.
+#
+# SINH_ARG_CLAMP is the hard safety net (sinh(20) ~ 2.4e8, comfortably finite
+# with headroom for the cosh() in the Jacobian). The parameter clamps below keep
+# normal operation well away from it; they are deliberately wide so that a
+# trained checkpoint's behaviour is unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
+SINH_ARG_CLAMP = 20.0
+LOG_DELTA_CLAMP = (-2.0, 4.0)
+EPS_SKEW_CLAMP = (-5.0, 5.0)
+
+
 def sinh_arcsinh_flow_nll_conditional(y, mu, log_sigma, eps_skew, log_delta, eps=1e-6):
     sigma = torch.exp(torch.clamp(log_sigma, -8.0, 6.0)) + eps
+    log_delta = torch.clamp(log_delta, *LOG_DELTA_CLAMP)
+    eps_skew = torch.clamp(eps_skew, *EPS_SKEW_CLAMP)
     delta = F.softplus(log_delta) + eps
     a = torch.asinh(y)
-    t = delta * a - eps_skew
+    t = torch.clamp(delta * a - eps_skew, -SINH_ARG_CLAMP, SINH_ARG_CLAMP)
     x = torch.sinh(t)
     log_abs_det = torch.log(torch.cosh(t) + eps) + torch.log(delta) - 0.5 * torch.log1p(y * y)
     r = (x - mu) / sigma
@@ -99,8 +122,12 @@ def sinh_arcsinh_flow_nll_conditional(y, mu, log_sigma, eps_skew, log_delta, eps
 
 
 def sinh_arcsinh_forward(x, eps_skew, log_delta, eps=1e-6):
+    log_delta = torch.clamp(log_delta, *LOG_DELTA_CLAMP)
+    eps_skew = torch.clamp(eps_skew, *EPS_SKEW_CLAMP)
     delta = F.softplus(log_delta) + eps
-    return torch.sinh((torch.asinh(x) + eps_skew) / delta)
+    arg = torch.clamp((torch.asinh(x) + eps_skew) / delta,
+                      -SINH_ARG_CLAMP, SINH_ARG_CLAMP)
+    return torch.sinh(arg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,6 +316,11 @@ class DeepSSMPatternConditioned(nn.Module):
         log_diag = torch.clamp(log_diag, -8.0, 8.0)
         cov_diag = F.softplus(log_diag) + 1e-4
         cov_factor = factor.reshape(B, 2 * D, r)
+        # Bound the SAS parameters at source. Unbounded, log_delta can drift
+        # negative until delta ~ 0 and the flow overflows to inf; see the note
+        # at the top of this module.
+        eps_skew = torch.clamp(eps_skew, *EPS_SKEW_CLAMP)
+        log_delta = torch.clamp(log_delta, *LOG_DELTA_CLAMP)
         return mu_joint, cov_factor, cov_diag, eps_skew, log_delta
 
     def _emit_step(self, e_in, u_t, B):
@@ -345,7 +377,10 @@ class DeepSSMPatternConditioned(nn.Module):
             delta = F.softplus(log_delta) + self.eps            # [B, D]
             y_pr_t = pr[:, t]                                   # [B, D]
             a = torch.asinh(y_pr_t)
-            t_sas = delta * a - eps_skew
+            # Mirror hazard to the forward map: a large delta drives t_sas past
+            # the sinh overflow point, giving inf in x_pr and NaN in log_prob.
+            t_sas = torch.clamp(delta * a - eps_skew,
+                                -SINH_ARG_CLAMP, SINH_ARG_CLAMP)
             x_pr = torch.sinh(t_sas)                            # [B, D]
             log_abs_det = (
                 torch.log(torch.cosh(t_sas) + self.eps)

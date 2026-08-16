@@ -135,6 +135,14 @@ if __name__ == "__main__":
     p.add_argument("--ssm_rollout_steps", type=int, default=0,
                    help="Differentiable rollout length for the ACF term; 0 uses the full horizon")
     p.add_argument("--ssm_rollout_samples", type=int, default=1)
+    p.add_argument("--annual_ssm", action="store_true",
+                   help="Use the simplified ELBO-only AnnualSSM instead of the monthly SSM")
+    p.add_argument("--annual_ssm_run_dir", type=str, default=None,
+                   help="AnnualSSM run directory; implies --annual_ssm and supplies weights + scalers")
+    p.add_argument("--annual_z_dim", type=int, default=16)
+    p.add_argument("--annual_rnn_hidden", type=int, default=64)
+    p.add_argument("--annual_emit_hidden", type=int, default=0)
+    p.add_argument("--annual_trans_hidden", type=int, default=0)
     p.add_argument("--z_dim", type=int, default=64)
     p.add_argument("--rnn_hidden", type=int, default=256)
     p.add_argument("--cov_rank", type=int, default=8)
@@ -175,6 +183,10 @@ if __name__ == "__main__":
     TRAIN_SCENARIOS = [s for s in TRAIN_SCENARIOS if s not in args.rm_data]
     print("MODEL_PATH", MODEL_PATH)
 
+    use_annual = args.annual_ssm or args.annual_ssm_run_dir is not None
+    if args.annual_ssm_run_dir is not None:
+        args.ssm_run_dir = args.annual_ssm_run_dir
+
     ssm_weights = args.ssm_weights
     if args.ssm_run_dir is not None:
         candidate = os.path.join(args.ssm_run_dir, "model_out")
@@ -205,10 +217,16 @@ if __name__ == "__main__":
             weight_decay=args.weight_decay, warmup_steps=args.warmup_steps,
             ssm_weights=ssm_weights, ssm_run_dir=args.ssm_run_dir,
             freeze_ssm=not (args.train_ssm or args.end_to_end),
+            use_annual_ssm=use_annual,
+            annual_z_dim=args.annual_z_dim,
+            annual_rnn_hidden=args.annual_rnn_hidden,
+            annual_emit_hidden=args.annual_emit_hidden,
+            annual_trans_hidden=args.annual_trans_hidden,
             ssm_elbo_weight=args.ssm_elbo_weight if args.end_to_end else 0.0,
             ssm_kl_weight=args.ssm_kl_weight,
             ssm_kl_free_bits=args.ssm_kl_free_bits,
-            ssm_acf_weight=args.ssm_acf_weight if args.end_to_end else 0.0,
+            ssm_acf_weight=(0.0 if use_annual
+                            else (args.ssm_acf_weight if args.end_to_end else 0.0)),
             ssm_acf_max_lag=args.ssm_acf_max_lag,
             ssm_rollout_steps=args.ssm_rollout_steps,
             ssm_rollout_samples=args.ssm_rollout_samples,
