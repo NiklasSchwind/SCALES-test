@@ -285,16 +285,20 @@ def run_train(
     if is_main:
         print(f"[model] diffusion parameterization: {parameterization}")
         if raw_model.use_ssm_aux:
+            acf_note = "" if raw_model.annual_ssm else f", acf_w={ssm_acf_weight}"
             print(f"[model] SSM auxiliary objective ON "
-                  f"(elbo_w={ssm_elbo_weight}, acf_w={ssm_acf_weight})")
+                  f"(elbo_w={ssm_elbo_weight}{acf_note})")
         elif not freeze_ssm:
             print("[model] WARNING: SSM is trainable but has no auxiliary "
-                  "objective. z is shaped by the diffusion loss alone and the "
-                  "oscillator has no ACF pressure; consider --ssm_elbo_weight.")
+                  "objective. z is shaped by the diffusion loss alone; "
+                  "consider --ssm_elbo_weight.")
 
-    # ctrl_lin is the frozen ridge pattern-scaling term. The SSM's own training
-    # fits and freezes it; the auxiliary ELBO uses it, so do the same here.
-    if raw_model.use_ssm_aux and raw_model.ssm_encoder.ssm.use_linear_model:
+    # ctrl_lin is the monthly SSM's frozen ridge pattern-scaling term, which its
+    # ELBO uses. The AnnualSSM has no such term by design: its emission takes
+    # cat([z, u]), so the linear u -> y path *is* pattern scaling, learned as
+    # part of the ELBO. Skip this entirely for the annual model.
+    if (raw_model.use_ssm_aux and not raw_model.annual_ssm
+            and raw_model.ssm_encoder.ssm.use_linear_model):
         W, b = scales_ssm_osc.fit_ridge_D(
             u_n[tr], tas_n[tr], alpha=1e-2, fit_intercept=True)
         scales_ssm_osc.load_into_ctrl_lin(raw_model.ssm_encoder.ssm, W, b, freeze=True)

@@ -360,3 +360,50 @@ def test_annual_ssm_rejects_acf_weight():
             freeze_ssm=False, cond_dim=32, hidden=32, depth=2, heads=4,
             n_diffusion_steps=100, field_memory_rank=8,
             ssm_elbo_weight=1.0, ssm_acf_weight=10.0)
+
+
+@pytest.mark.parametrize("use_annual,end_to_end", [(True, True), (True, False), (False, True)])
+def test_run_train_config_combinations_construct(use_annual, end_to_end, tmp_path):
+    """
+    Regression: `run_train` ridge-initialised ctrl_lin whenever the auxiliary
+    objective was on, without checking which SSM it held. AnnualSSM has no
+    ctrl_lin (its emission's u -> y path is the pattern scaling), so
+    --annual_ssm --end_to_end raised AttributeError.
+
+    Exercises run_train's setup path for each CLI combination; a single short
+    epoch is enough since the failure was at construction.
+    """
+    import os
+    import numpy as np
+    import torch.distributed as dist
+    import proto_scales.ssm_dit_model.training as training
+
+    if dist.is_initialized():
+        pytest.skip("process group already initialised by another test")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = str(29700 + hash((use_annual, end_to_end)) % 200)
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+
+    rng = np.random.default_rng(0)
+    n, t, d = 4, 12 * 8, 3
+    u = rng.standard_normal((n, t, 1)).astype("float32")
+    tas = rng.standard_normal((n, t, d)).astype("float32")
+    pr = rng.standard_normal((n, t, d)).astype("float32")
+    try:
+        training.run_train(
+            tas, pr, u, context_len=24, horizon=24, batch_size=4, epochs=1,
+            lr=1e-3, warmup_steps=2, use_annual_ssm=use_annual,
+            annual_z_dim=8, annual_rnn_hidden=16,
+            z_dim=8, rnn_hidden=16, cov_rank=3,
+            freeze_ssm=not end_to_end,
+            ssm_elbo_weight=1.0 if end_to_end else 0.0,
+            ssm_acf_weight=0.0,
+            cond_dim=32, hidden=32, depth=2, heads=4, n_diffusion_steps=50,
+            field_memory_rank=8, ema_decay=0.9, stride=12,
+            run_dir=str(tmp_path),
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
