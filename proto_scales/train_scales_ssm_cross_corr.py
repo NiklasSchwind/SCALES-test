@@ -46,7 +46,12 @@ if __name__ == "__main__":
     parser.add_argument("--acf_max_lag", type=int, default=120, help="Max lag (months) for ACF loss; 0 disables it")
     parser.add_argument("--acf_weight", type=float, default=5000.0, help="Weight for ACF loss term")
     parser.add_argument("--rollout_steps", type=int, default=120, help="Length (months) of the differentiable rollout used for the rollout-MSE and ACF losses; caps the longest resolvable ACF lag at (rollout_steps-1)//2")
-    parser.add_argument("--rollout_samples", type=int, default=1, help="Samples per differentiable rollout; memory scales linearly")
+    parser.add_argument("--rollout_samples", type=int, default=1, help="Samples per differentiable rollout; memory scales linearly. Must be >= 4 if any rollout-MSE weight is non-zero")
+    parser.add_argument("--kl_w", type=float, default=5.0, help="Weight on the KL term")
+    parser.add_argument("--rollout_mse_weight", type=float, default=0.0, help="Weight on the monthly tas rollout Huber (was hardcoded 2000). Default 0: at rollout_samples=1 this term penalises the model's own predictive variance and collapses internal variability")
+    parser.add_argument("--rollout_mse_pr_weight", type=float, default=0.0, help="Weight on the monthly pr rollout Huber (was hardcoded 100). Same caveat")
+    parser.add_argument("--rollout_mse_yearly_weight", type=float, default=0.0, help="Weight on the annual-mean rollout MSE (was hardcoded 20000). Same mechanism, damped ~3.5x by annual averaging")
+    parser.add_argument("--init_spectral_radius", type=float, default=0.98, help="Bound on the transition spectral radius; sets latent memory. 0.98 ~= 4yr e-folding, 0.99 ~= 8yr")
 
     args = parser.parse_args()
 
@@ -132,13 +137,23 @@ if __name__ == "__main__":
         f.write(f"acf_weight={args.acf_weight}\n")
         f.write(f"rollout_steps={args.rollout_steps}\n")
         f.write(f"rollout_samples={args.rollout_samples}\n")
+        f.write(f"kl_w={args.kl_w}\n")
+        f.write(f"rollout_mse_weight={args.rollout_mse_weight}\n")
+        f.write(f"rollout_mse_pr_weight={args.rollout_mse_pr_weight}\n")
+        f.write(f"rollout_mse_yearly_weight={args.rollout_mse_yearly_weight}\n")
+        f.write(f"init_spectral_radius={args.init_spectral_radius}\n")
 
     try:
         model, y_scaler, u_scaler,pr_scaler = scales_ssm_z2pr.run_train(tas, pr,u, context_len=600, z_dim=64,rnn_hidden=256,horizon=1200,
             use_linear_model=use_linear_model,epochs=epochs,batch_size=250,alpha_max=args.alpha_max, resevoir_dim=args.reservoir,
             cov_rank=args.cov_rank, run_dir=run_dir, weights_file=args.weights_file,
             acf_max_lag=args.acf_max_lag, acf_weight=args.acf_weight,
-            rollout_steps=args.rollout_steps, rollout_samples=args.rollout_samples)
+            rollout_steps=args.rollout_steps, rollout_samples=args.rollout_samples,
+            kl_w=args.kl_w,
+            rollout_mse_weight=args.rollout_mse_weight,
+            rollout_mse_pr_weight=args.rollout_mse_pr_weight,
+            rollout_mse_yearly_weight=args.rollout_mse_yearly_weight,
+            init_spectral_radius=args.init_spectral_radius)
     except Exception:
         print(f"[Rank {_local_rank}] run_train failed:", flush=True)
         traceback.print_exc()

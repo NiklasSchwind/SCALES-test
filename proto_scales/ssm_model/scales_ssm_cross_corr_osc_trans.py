@@ -23,18 +23,35 @@ Improvements vs. the original module
      log p(y_tas, y_pr) = log N([y_tas; x_pr]; μ, LLᵀ+D) + log|dx_pr/dy_pr|
    where x_pr is the inverse of the sinh–arcsinh flow applied to y_pr.
 
-2. Oscillatory latent transition
-   -------------------------------
-   The latent transition p(z_t | z_{t-1}, u_t) is augmented with a linear
-   block-diagonal oscillatory core:
-     mu_p = R(ω)·exp(-damping)·z_{t-1} + B·u_t + MLP_correction(z_{t-1}, u_t)
+2. Contractive linear latent transition (replaced the explicit oscillator)
+   ------------------------------------------------------------------------
+     mu_p = ρ·A·z_{t-1} + B·u_t + MLP_correction(z_{t-1}, u_t)
      logvar_p = MLP_var(z_{t-1}, u_t)
-   The oscillator pairs adjacent z-dimensions into 2D rotations with learned
-   per-pair frequency ω and damping. Frequencies are initialised across the
-   ENSO band (period 12–240 months). This gives complex eigenvalues by
-   construction, so the model has an inductive bias for damped oscillatory
-   modes in the latent state — the mechanism that was missing to represent
-   ENSO-like internal variability.
+   with A spectral-normalised and ρ = sigmoid(ρ_raw) ∈ (0,1), so every
+   eigenvalue has modulus < ρ < 1 and the latent is stable by construction.
+   A is initialised near the identity, giving genuine persistence from the
+   first step.
+
+   This replaced a bank of explicit 2D rotations, for two reasons.
+
+   *The amplitude gate destroyed the latent's memory.* Oscillator amplitude
+   was gated by sigmoid(log_amp) initialised at -2.2 ≈ 0.0998, so the linear
+   recurrence had |λ| ≈ 0.099 **per month** — a memory half-life of 0.3
+   months, retaining 9e-13 of its amplitude after a year. z could therefore
+   carry neither temporal correlation (bad ACF) nor slow forced information
+   (bad hysteresis / delayed warming). The gate existed so oscillators would
+   "earn" amplitude from the ACF loss, which was inert. An ENSO-like mode
+   needs |λ| ≈ 0.9835; the default ρ = 0.98 gives ~4 years.
+
+   *The frequency band excluded the seasonal cycle.* Periods were initialised
+   over 24–240 months, so the 12-month cycle — the dominant feature of the
+   observed ACF — was a factor of two below anything representable. A general
+   matrix has no band limit.
+
+   Oscillations are not lost by removing the explicit rotations: a linear
+   operator has complex eigenvalues generically. Reading them off a fitted
+   transition is Principal Oscillation Pattern analysis; see `modes()`, which
+   returns learned periods and e-folding times in months.
 
 3. Differentiable rollout for the auxiliary losses
    ------------------------------------------------
@@ -206,11 +223,8 @@ class DeepSSMPatternConditioned(nn.Module):
     def __init__(self, y_dim, u_dim, z_dim=16, rnn_hidden=62, u_rnn_hidden=64, mlp_hidden=128,
                  emission_uses_u=False, use_linear_model=True, reservoir_dim=2,
                  init_alpha=0.01, init_omega=1.0, alpha_max=0.02, cov_rank=5,
-                 osc_damping_max=0.1, osc_freq_range=(2 * math.pi / 240.0, 2 * math.pi / 24.0),
-                 osc_init_damp_ratio=0.05):
+                 init_spectral_radius=0.98):
         super().__init__()
-        if z_dim % 2 != 0:
-            raise ValueError("z_dim must be even (paired into 2D oscillators)")
         self.y_dim = y_dim
         self.u_dim = u_dim
         self.z_dim = z_dim
@@ -220,23 +234,48 @@ class DeepSSMPatternConditioned(nn.Module):
         self.reservoir_dim = reservoir_dim
         self.alpha_max = alpha_max
         self.cov_rank = cov_rank
-        self.n_osc = z_dim // 2
-        self.osc_damping_max = osc_damping_max
 
         # Inference GRU on [y, u]
         self.gru = nn.GRU(input_size=y_dim + u_dim, hidden_size=rnn_hidden, batch_first=True)
         self.q_head = nn.Linear(rnn_hidden, 2 * z_dim)
 
-        # Oscillatory transition parameters
-        # log_damping raw such that sigmoid(log_damping) * osc_damping_max = init damp
-        init_raw = math.log(osc_init_damp_ratio / (1.0 - osc_init_damp_ratio))
-        self.log_damping = nn.Parameter(torch.full((self.n_osc,), init_raw))
-        # Spread ω across the requested range (log-spaced)
-        omega_lo, omega_hi = osc_freq_range
-        self.omega = nn.Parameter(torch.linspace(omega_lo, omega_hi, self.n_osc))
-        # Learnable per-oscillator amplitude gate; sigmoid(-2.2) ≈ 0.1 so oscillators
-        # start small and must earn their amplitude via the ACF loss.
-        self.log_amp = nn.Parameter(torch.full((self.n_osc,), -2.2))
+        # ── Linear transition core ───────────────────────────────────────────
+        # Replaces the explicit bank of 2D rotations. Oscillations do not have to
+        # be hard-coded: a linear operator has complex eigenvalues generically,
+        # and reading them off a *fitted* transition matrix is exactly Principal
+        # Oscillation Pattern analysis. The rotation bank was the special case of
+        # a normal matrix with non-interacting pairs — strictly less expressive —
+        # and it forced a frequency band to be chosen up front. That band was
+        # 24–240 months, which excluded the annual cycle entirely and so made the
+        # dominant feature of the observed ACF structurally unreachable.
+        #
+        # It also removes the amplitude gate, which was the real damage: with
+        # sigmoid(-2.2) ≈ 0.0998 the latent recurrence had |λ| ≈ 0.099 per MONTH,
+        # a memory half-life of 0.3 months. z therefore carried almost no
+        # temporal correlation (bad ACF) and could not hold slow forced
+        # information (bad hysteresis / delayed warming). The gate was meant to
+        # let oscillators "earn" amplitude from the ACF loss, which was inert.
+        #
+        # A is spectral-normalised (‖A‖₂ = 1) and scaled by ρ = sigmoid(ρ_raw),
+        # so every eigenvalue has modulus < ρ < 1 and the latent process is
+        # stable by construction — the one useful property damping provided.
+        #
+        # A is initialised near the IDENTITY, not randomly. ρ bounds the spectral
+        # radius but does not set it: a random matrix normalised to unit spectral
+        # *norm* has eigenvalues filling a disk of roughly half that radius, so
+        # random init would give ~1-year memory and reintroduce the very problem
+        # this change fixes. Persistence is also the right prior for a slow
+        # latent; the small random part breaks symmetry and lets eigenvalues
+        # become complex if the data asks for it.
+        _A = nn.Linear(z_dim, z_dim, bias=False)
+        with torch.no_grad():
+            _A.weight.copy_(torch.eye(z_dim)
+                            + 0.05 * torch.randn(z_dim, z_dim) / math.sqrt(z_dim))
+        self.A = nn.utils.parametrizations.spectral_norm(_A)
+        r = float(init_spectral_radius)
+        if not (0.0 < r < 1.0):
+            raise ValueError("init_spectral_radius must be in (0, 1)")
+        self.rho_raw = nn.Parameter(torch.tensor(math.log(r / (1.0 - r))))
         # Linear input coupling (B·u_t)
         self.B_osc = nn.Linear(u_dim, z_dim, bias=False)
         # MLP correction on top of linear oscillator
@@ -275,24 +314,39 @@ class DeepSSMPatternConditioned(nn.Module):
         target = self.omega_lin(uh_t).reshape(uh_t.shape[0], self.y_dim, self.reservoir_dim)
         return s + alpha[None] * (target - s)
 
-    def _osc_transition(self, z_prev, u_t):
-        """Oscillatory prior mean + MLP correction; returns (mu_p, logvar_p)."""
-        B = z_prev.shape[0]
-        # Block-diagonal 2D rotations with damping
-        z_pairs = z_prev.reshape(B, self.n_osc, 2)
-        damp = torch.sigmoid(self.log_damping) * self.osc_damping_max        # [n_osc]
-        decay = torch.exp(-damp)                                             # [n_osc]
-        amp = torch.sigmoid(self.log_amp)                                    # [n_osc]
-        cos_w = torch.cos(self.omega)                                        # [n_osc]
-        sin_w = torch.sin(self.omega)                                        # [n_osc]
-        z0 = amp * decay * (cos_w * z_pairs[..., 0] - sin_w * z_pairs[..., 1])   # [B, n_osc]
-        z1 = amp * decay * (sin_w * z_pairs[..., 0] + cos_w * z_pairs[..., 1])   # [B, n_osc]
-        z_osc = torch.stack([z0, z1], dim=-1).reshape(B, self.z_dim)
+    def _transition(self, z_prev, u_t):
+        """Contractive linear core + forcing + MLP correction -> (mu_p, logvar_p)."""
+        rho = torch.sigmoid(self.rho_raw)
+        z_lin = rho * self.A(z_prev)                                         # [B, z_dim]
         z_input = self.B_osc(u_t)                                            # [B, z_dim]
         corr = self.trans_corr(torch.cat([z_prev, u_t], dim=-1))             # [B, 2·z_dim]
         mu_corr, logvar_p = torch.chunk(corr, 2, dim=-1)
-        mu_p = z_osc + z_input + mu_corr
+        mu_p = z_lin + z_input + mu_corr
         return mu_p, logvar_p
+
+    # Kept so existing callers (and notebooks) keep working after the rename.
+    _osc_transition = _transition
+
+    @torch.no_grad()
+    def modes(self, months_per_year=12, tol=1e-3):
+        """
+        Principal Oscillation Patterns of the learned transition.
+
+        Returns (periods_months, efolding_months, moduli) sorted by persistence.
+        An eigenvalue λ = r·e^{iθ} is a mode of period 2π/θ months damped with
+        e-folding −1/ln(r). Real eigenvalues report an infinite period. Nothing
+        here is imposed — it is read back out of the fit, which is the point of
+        dropping the explicit oscillator.
+        """
+        W = self.A.weight * torch.sigmoid(self.rho_raw)
+        lam = torch.linalg.eigvals(W.to(torch.float32))
+        r = lam.abs().clamp(1e-8, 1 - 1e-8)
+        theta = lam.angle().abs()
+        period = torch.where(theta > tol, 2.0 * math.pi / theta.clamp(min=tol),
+                             torch.full_like(theta, float("inf")))
+        efold = -1.0 / torch.log(r)
+        order = torch.argsort(efold, descending=True)
+        return period[order].cpu(), efold[order].cpu(), r[order].cpu()
 
     def _parse_emit(self, emit_out, B):
         """
@@ -701,7 +755,37 @@ def run_train(
     acf_weight=5000.0,
     rollout_steps=120,
     rollout_samples=1,
+    kl_w=5.0,
+    rollout_mse_weight=0.0,
+    rollout_mse_pr_weight=0.0,
+    rollout_mse_yearly_weight=0.0,
+    init_spectral_radius=0.98,
 ):
+    """
+    On the rollout-MSE weights (previously hardcoded at 2000 / 100 / 20000):
+
+    `mean = tas_s.mean(0)` is the mean over `rollout_samples` draws, so at the
+    default of 1 it *is* a single reparameterised sample. Minimising
+    huber(sample, truth) decomposes as
+
+        E[(mu + sigma*eps - y)^2] = (mu - E[y])^2 + sigma^2 + Var(y)
+
+    and that sigma^2 term penalises the model's own predictive variance. In a
+    direct test this collapsed sigma from 1.0 to 0.016 while mu converged
+    correctly. Internal variability is unpredictable by construction, so asking
+    a single realisation to match the truth pointwise can only be satisfied by
+    becoming deterministic.
+
+    They therefore default to 0, which reproduces the ELBO-dominated behaviour
+    these weights had while the rollout was still non-differentiable. If you do
+    want them, set `rollout_samples >= 4` first so `mean` is an actual ensemble
+    mean; a warning is printed otherwise.
+
+    They also only ever constrain `rollout_steps` months (120 by default = 10
+    years), so they cannot teach a multi-century response such as Southern Ocean
+    delayed warming. That signal lives in the ELBO over the full context+horizon
+    window.
+    """
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     use_cuda = torch.cuda.is_available()
     backend = "nccl" if use_cuda else "gloo"
@@ -717,6 +801,13 @@ def run_train(
 
     y_tr, pr_tr, u_tr = y_np[tr_idx], pr_np[tr_idx], u_np[tr_idx]
     y_va, pr_va, u_va = y_np[va_idx], pr_np[va_idx], u_np[va_idx]
+
+    if (max(rollout_mse_weight, rollout_mse_pr_weight, rollout_mse_yearly_weight) > 0
+            and rollout_samples < 4):
+        print(f"[warn] rollout-MSE weights are non-zero with rollout_samples="
+              f"{rollout_samples}: `mean` is then (near) a single reparameterised "
+              f"draw and the term penalises the model's own predictive variance. "
+              f"Use rollout_samples >= 4 or set the weights to 0.")
 
     print("training start")
 
@@ -752,6 +843,7 @@ def run_train(
         y_dim=Dy, u_dim=Du, z_dim=z_dim, rnn_hidden=rnn_hidden,
         use_linear_model=use_linear_model, emission_uses_u=True,
         reservoir_dim=resevoir_dim, alpha_max=alpha_max, cov_rank=cov_rank,
+        init_spectral_radius=init_spectral_radius,
     ).to(device)
     if weights_file is not None:
         ckpt = torch.load(weights_file, map_location=device)
@@ -760,15 +852,7 @@ def run_train(
             print(f"Warm-start: initialising missing keys {missing}")
         if unexpected:
             print(f"Warm-start: ignoring unexpected keys {unexpected}")
-        # Re-initialise oscillator frequencies and amplitude gates so they start
-        # in the correct range rather than carrying over values tuned for the
-        # old (wider) frequency range.
-        omega_lo = 2 * math.pi / 240.0
-        omega_hi = 2 * math.pi / 24.0
-        with torch.no_grad():
-            raw_model.omega.copy_(torch.linspace(omega_lo, omega_hi, raw_model.n_osc))
-            raw_model.log_amp.fill_(-2.2)
-        print(f"Loaded weights from {weights_file} (oscillator params reset to new range)")
+        print(f"Loaded weights from {weights_file}")
     if use_linear_model:
         load_into_ctrl_lin(raw_model, W, b, freeze=True)
 
@@ -832,18 +916,16 @@ def run_train(
             else:
                 roll_out_mse_yearly = torch.tensor(0.0, device=device)
 
-            # NOTE: until the rollout was made differentiable these weights were
-            # inert (see rollout_samples). They are kept at their previous values
-            # as a starting point only — retune against the printed weighted
-            # contributions below. Watch for variance collapse: alpha/gamma pull
-            # the ensemble mean onto a single realisation, which the NLL and ACF
-            # terms have to push back against.
+            # Rollout-MSE weights now default to 0 — see the note on
+            # `rollout_mse_weight` in the run_train signature. They are a
+            # variance-collapse term at rollout_samples=1, which is what made
+            # the ACF and the delayed-warming response worse once the rollout
+            # became differentiable.
             global_step += 1
             frac = min(1.0, global_step / int(0.3 * total_steps))
-            kl_w = 5
-            alpha = 2000 * frac
-            omega = 100 * frac
-            gamma = 20000
+            alpha = rollout_mse_weight * frac
+            omega = rollout_mse_pr_weight * frac
+            gamma = rollout_mse_yearly_weight
 
             # Clip max_lag so the FFT-based ACF is valid: need sequence > 2*lag.
             # The rollout length R therefore caps which periods can be penalised:
