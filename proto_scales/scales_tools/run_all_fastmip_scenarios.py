@@ -202,7 +202,7 @@ def compute_yearly_stats(out_nc):
     return out_stats_nc
 
 
-def plot_yearly_stats(out_stats_nc, region_sel="NZ", save_dir=None):
+def plot_yearly_stats(out_stats_nc, region_sel="EAS", save_dir=None):
     esm_colors = {
         "ACCESS-ESM1-5":  "#1f77b4",
         "CanESM5":        "#d62728",
