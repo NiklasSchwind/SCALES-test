@@ -448,7 +448,7 @@ def process_scenarios(experiment_scenario_path, simulation_name, baseline_scenar
         
     else:
         #df_regional_smoothed = df_regional_anomaly.rolling(window=21*12, center = True).mean()
-        df_annual = df_regional_anomaly.resample('Y').mean()
+        df_annual = df_regional_anomaly.resample('YE').mean()
         if smoothed:
             df_regional_smoothed = df_annual.rolling(window=21, center=True).mean()
         else: 
@@ -485,7 +485,7 @@ def detect_is_monthly(df, gmt_df):
     # Case 1: Index is datetime → use infer_freq
     if isinstance(idx, pd.DatetimeIndex):
         freq = pd.infer_freq(idx)
-        return freq in ['M', 'MS']
+        return freq in ['M', 'MS', 'ME']
 
     # Case 2: Index is integer years → assume annual
     if np.issubdtype(idx.dtype, np.integer):
@@ -496,7 +496,7 @@ def detect_is_monthly(df, gmt_df):
     try:
         idx_dt = pd.to_datetime(idx, format='%Y-%m')
         freq = pd.infer_freq(idx_dt)
-        return freq in ['M', 'MS']
+        return freq in ['M', 'MS', 'ME']
     except Exception:
         pass
 
