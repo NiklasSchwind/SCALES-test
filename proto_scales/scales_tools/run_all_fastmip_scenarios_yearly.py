@@ -2,9 +2,13 @@ import argparse
 import os
 import re
 
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 import matplotlib
 matplotlib.use("Agg")   # no display needed on cluster
 import matplotlib.pyplot as plt
+import numpy as np
+import regionmask
 import torch
 import xarray as xr
 
@@ -35,6 +39,13 @@ ALT_NAME_ABBREV = {
 }
 
 QUANTILES = [0.01, 0.025, 0.05, 0.33, 0.5, 0.67, 0.95, 0.975, 0.99]
+
+# The "mask" coordinate in the yearly-stats files holds AR6 region abbrevs
+# (plus a synthetic "GLOBAL" entry with no polygon of its own, produced
+# alongside the real AR6 regions elsewhere in the pipeline; see
+# create_mask.py). `ar6.all` is the same region set + abbrev convention
+# used there.
+AR6_REGIONS = regionmask.defined_regions.ar6.all
 
 def _parse_scenario_tag(out_nc):
     """
@@ -304,6 +315,113 @@ def plot_yearly_stats_fastmip(out_tas_nc, out_pr_nc, region_sel="EAS", save_dir=
         plt.savefig(fig_path, dpi=150)
         print(f"Plot saved -> {fig_path}", flush=True)
     #plt.close(fig)
+    ds_tas.close()
+    ds_pr.close()
+
+
+def _region_value_grid(region_values, lon_res=1.0, lat_res=1.0):
+    """
+    Rasterise a {abbrev: value} dict over the AR6 regions onto a lon/lat grid,
+    for plotting as a choropleth with `pcolormesh`.
+
+    A region whose abbrev is not a key of `region_values` (chiefly the
+    synthetic "GLOBAL" mask entry, which has no AR6 polygon) is left as NaN,
+    same as everywhere outside every AR6 region.
+
+    Returns (lon, lat, grid) with `grid.shape == (len(lat), len(lon))`.
+    """
+    lon = np.arange(-179.5, 180.0, lon_res)
+    lat = np.arange(-89.5, 90.0, lat_res)
+    number_grid = AR6_REGIONS.mask(lon, lat).values
+
+    grid = np.full(number_grid.shape, np.nan)
+    for region in AR6_REGIONS:
+        value = region_values.get(region.abbrev)
+        if value is not None:
+            grid[number_grid == region.number] = value
+    return lon, lat, grid
+
+
+def plot_average_climate_change(out_tas_nc, out_pr_nc, year_range,
+                                 esm_calibration=None, save_dir=None):
+    """
+    Two AR6-region maps (tas, pr) side by side, each region filled with its
+    `*_mean` averaged over `year_range` — the same field `plot_yearly_stats_fastmip`
+    plots as a time series, collapsed here to one number per region instead of
+    one curve per ESM. Both fields are already anomalies, so this map is
+    directly "average climate change over `year_range`", not a value needing a
+    separate baseline subtracted.
+
+    `out_tas_nc`/`out_pr_nc` are `compute_yearly_stats_for_fastmip`'s by-ESM
+    output. `esm_calibration` selects which ESM calibration to show; defaults
+    to whichever one appears first in the file. `year_range` is `(start, end)`,
+    inclusive on both ends.
+    """
+    ds_tas = xr.open_dataset(out_tas_nc)
+    ds_pr = xr.open_dataset(out_pr_nc)
+
+    if esm_calibration is None:
+        esm_calibration = str(ds_tas.esm_calibration.values[0])
+
+    year_start, year_end = year_range
+    year_sel = slice(year_start, year_end)
+    tas_avg = ds_tas["tas_mean"].sel(esm_calibration=esm_calibration, year=year_sel).mean("year")
+    pr_avg = ds_pr["pr_mean"].sel(esm_calibration=esm_calibration, year=year_sel).mean("year")
+
+    tas_values = dict(zip(tas_avg.mask.values.tolist(), tas_avg.values.tolist()))
+    pr_values = dict(zip(pr_avg.mask.values.tolist(), pr_avg.values.tolist()))
+
+    lon, lat, tas_grid = _region_value_grid(tas_values)
+    _, _, pr_grid = _region_value_grid(pr_values)
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(15, 5.5), dpi=150,
+        subplot_kw={"projection": ccrs.PlateCarree()},
+    )
+    panels = [
+        (axes[0], tas_grid, "RdBu_r", "tas anomaly [K]"),
+        (axes[1], pr_grid, "BrBG", "pr anomaly [kg m⁻² s⁻¹]"),
+    ]
+    # cartopy fetches Natural Earth shapefiles lazily, on first draw, from the
+    # network — so on a compute node with no outbound internet access (e.g.
+    # the cluster this pipeline actually runs on) `ax.coastlines()` renders
+    # fine here but raises inside `savefig`. Probe once, eagerly, so a missing
+    # cache/network degrades to "no coastlines" instead of failing the plot.
+    try:
+        list(cfeature.COASTLINE.with_scale("110m").geometries())
+        have_natural_earth = True
+    except Exception as e:
+        have_natural_earth = False
+        print(f"[plot_average_climate_change] Natural Earth coastlines/borders "
+              f"unavailable (no cache, no network?): {e}. Plotting regions "
+              f"without a coastline overlay.")
+
+    for ax, grid, cmap, label in panels:
+        vmax = np.nanmax(np.abs(grid))
+        im = ax.pcolormesh(lon, lat, grid, transform=ccrs.PlateCarree(),
+                           cmap=cmap, vmin=-vmax, vmax=vmax, shading="auto")
+        if have_natural_earth:
+            ax.coastlines(linewidth=0.5)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.5)
+        ax.set_global()
+        cb = fig.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.8)
+        cb.set_label(label, fontsize=11)
+
+    fig.suptitle(
+        f"Average climate change {year_start}–{year_end}  |  {esm_calibration}  |  "
+        f"scenario: {ds_tas.attrs.get('scenario', '')}",
+        fontsize=12,
+    )
+    plt.tight_layout()
+
+    if save_dir is not None:
+        scenario_tag = os.path.basename(out_tas_nc).replace("_tas_regional_quantiles-by-ESM_yearly.nc", "")
+        fig_path = os.path.join(
+            save_dir,
+            f"{scenario_tag}_{esm_calibration}_{year_start}-{year_end}_avg_change_map.png")
+        plt.savefig(fig_path, dpi=150)
+        print(f"Plot saved -> {fig_path}", flush=True)
+    plt.close(fig)
     ds_tas.close()
     ds_pr.close()
 
