@@ -36,7 +36,7 @@ def make_model(**kw):
     base = dict(
         y_dim=Y_DIM, u_dim=U_DIM, z_dim=8, rnn_hidden=16,
         context_len=TC, block_len=BLK, cond_dim=64, hidden=64, depth=2, heads=4,
-        n_diffusion_steps=100, field_memory_rank=8, timescales_years=(1.0, 5.0),
+        n_flow_steps=10, field_memory_rank=8, timescales_years=(1.0, 5.0),
     )
     base.update(kw)
     return build_model(**base)
@@ -171,10 +171,10 @@ def test_loss_finite_and_all_params_get_gradient(batch):
     m = make_model()
     loss, parts = m.loss(**batch, block_idx=[0, 4], start_month=3, return_parts=True)
     assert torch.isfinite(loss)
-    for k in ("diffusion", "ssm_nll", "ssm_kl", "ssm_rollout"):
+    for k in ("flow_matching", "ssm_nll", "ssm_kl", "ssm_rollout"):
         assert k in parts
     # per-block reporting, so drift with lead time is visible from one call
-    assert "diff_blk0" in parts and "diff_blk4" in parts
+    assert "flow_blk0" in parts and "flow_blk4" in parts
 
     loss.backward()
     missing = [n for n, p in m.named_parameters()
@@ -206,11 +206,11 @@ def test_block_choice_changes_the_diffusion_term(batch):
     if they did, z would not be carrying anything across the horizon.
     """
     m = make_model()
-    t_fixed = torch.zeros(B, dtype=torch.long) + 50
+    t_fixed = torch.full((B,), 0.5)
     with torch.no_grad():
-        _, p0 = m.loss(**batch, block_idx=[0], t_diff=t_fixed, return_parts=True)
-        _, p4 = m.loss(**batch, block_idx=[4], t_diff=t_fixed, return_parts=True)
-    assert abs(float(p0["diffusion"]) - float(p4["diffusion"])) > 1e-6
+        _, p0 = m.loss(**batch, block_idx=[0], t=t_fixed, return_parts=True)
+        _, p4 = m.loss(**batch, block_idx=[4], t=t_fixed, return_parts=True)
+    assert abs(float(p0["flow_matching"]) - float(p4["flow_matching"])) > 1e-6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,11 +248,6 @@ def test_sample_blocks_is_reproducible(model):
 def test_window_lengths_must_be_whole_years(kw):
     with pytest.raises(ValueError):
         make_model(**kw)
-
-
-def test_bad_parameterization_rejected():
-    with pytest.raises(ValueError):
-        make_model(parameterization="x0")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

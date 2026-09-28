@@ -155,9 +155,8 @@ if __name__ == "__main__":
     p.add_argument("--depth", type=int, default=8)
     p.add_argument("--heads", type=int, default=6)
     p.add_argument("--cond_dim", type=int, default=256)
-    p.add_argument("--n_diffusion_steps", type=int, default=1000)
-    p.add_argument("--parameterization", type=str, default="v", choices=["v", "eps"],
-                   help="Diffusion target. 'v' is the default: eps-prediction is unstable at high noise for these fields")
+    p.add_argument("--n_flow_steps", type=int, default=50,
+                   help="Default number of Euler steps for the flow-matching ODE at sampling time; overridable per call via sample_blocks(n_steps=...). Linear flow paths need far fewer steps than a DDPM chain")
     p.add_argument("--field_memory_rank", type=int, default=32)
     p.add_argument("--timescales", nargs="+", type=float, default=[1.0, 5.0, 20.0],
                    help="Memory-kernel relaxation times in YEARS. The kernels are window-local, so anything much beyond the window length is dead weight; century-scale memory is z's job")
@@ -215,11 +214,10 @@ if __name__ == "__main__":
             ssm_rollout_weight=args.ssm_rollout_weight,
             stochastic_z=args.stochastic_z,
             cond_dim=args.cond_dim, hidden=args.hidden, depth=args.depth,
-            heads=args.heads, n_diffusion_steps=args.n_diffusion_steps,
+            heads=args.heads, n_flow_steps=args.n_flow_steps,
             timescales_years=tuple(args.timescales),
             learnable_timescales=not args.fixed_timescales,
             field_memory_rank=args.field_memory_rank,
-            parameterization=args.parameterization,
             ema_decay=args.ema_decay, stride=args.stride,
             data_start_month=args.data_start_month,
             run_dir=run_dir, weights_file=args.weights_file,

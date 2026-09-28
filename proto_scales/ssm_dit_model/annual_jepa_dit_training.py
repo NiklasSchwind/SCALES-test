@@ -62,11 +62,10 @@ def run_train(
     hidden=384,
     depth=8,
     heads=6,
-    n_diffusion_steps=1000,
+    n_flow_steps=50,
     timescales_years=(1.0, 5.0, 20.0),
     learnable_timescales=True,
     field_memory_rank=32,
-    parameterization="v",
     # misc
     ema_decay=0.999,
     stride=7,
@@ -158,11 +157,10 @@ def run_train(
         jepa=jepa, y_dim=Dy, u_dim=Du,
         context_len=context_len, block_len=block_len, freeze_ssm=freeze_jepa,
         cond_dim=cond_dim, hidden=hidden, depth=depth, heads=heads,
-        n_diffusion_steps=n_diffusion_steps,
+        n_flow_steps=n_flow_steps,
         timescales_years=timescales_years,
         learnable_timescales=learnable_timescales,
         field_memory_rank=field_memory_rank,
-        parameterization=parameterization,
         jepa_weight=jepa_weight,
         jepa_rollout_weight=jepa_rollout_weight,
     ).to(device)
@@ -170,7 +168,7 @@ def run_train(
     n_blocks = raw_model.n_blocks(horizon)
     blocks_per_step = max(1, min(int(blocks_per_step), n_blocks))
     if is_main:
-        print(f"[model] diffusion parameterization: {parameterization}")
+        print(f"[model] linear flow matching, {n_flow_steps} sampling steps by default")
         print(f"[model] {n_blocks} DiT blocks per super-window, "
               f"{blocks_per_step} sampled per step "
               f"(effective batch {batch_size * blocks_per_step})")
@@ -182,8 +180,8 @@ def run_train(
                   f"target_decay={target_decay})")
         elif not freeze_jepa:
             print("[model] WARNING: JEPA latent process is trainable but has no "
-                  "auxiliary objective. z is shaped by the diffusion loss alone, "
-                  "and nothing scores the multi-step rollout the sampler "
+                  "auxiliary objective. z is shaped by the flow-matching loss "
+                  "alone, and nothing scores the multi-step rollout the sampler "
                   "iterates.")
 
     if weights_file is not None:
@@ -293,21 +291,21 @@ def run_train(
                       f"{extra} | lr {sched.get_last_lr()[0]:.2e}")
 
         # ---- validation ----------------------------------------------------
-        # Stratified diffusion timesteps rather than random draws: the
-        # random-t loss has enough variance to swamp the epoch-to-epoch signal
-        # and makes early stopping meaningless.
+        # Stratified flow times rather than random draws: the random-t loss
+        # has enough variance to swamp the epoch-to-epoch signal and makes
+        # early stopping meaningless.
         model.eval()
         va_losses = []
-        va_per_block = {f"diff_blk{b}": [] for b in val_blocks}
+        va_per_block = {f"flow_blk{b}": [] for b in val_blocks}
         with torch.no_grad():
             for batch in val_dl:
                 tas_c, pr_c, u_c, tas_f, pr_f, u_f, sm = to_dev(batch)
                 B = tas_c.shape[0]
-                t_strat = torch.linspace(0, n_diffusion_steps - 1, B, device=device).long()
+                t_strat = torch.linspace(0.0, 1.0, B, device=device)
                 v, p = raw_model.loss(
                     tas_c, pr_c, u_c, tas_f, pr_f, u_f,
                     block_idx=val_blocks, start_month=int(sm[0].item()),
-                    t_diff=t_strat, return_parts=True)
+                    t=t_strat, return_parts=True)
                 va_losses.append(v.item())
                 for k in va_per_block:
                     if k in p:

@@ -83,6 +83,20 @@ units. One `transition` call is one year (dt = 1 is implicit; the only thing
 tying the latent clock to physical time is `to_annual`), so `context_len` and
 `block_len` must both be whole years for block boundaries to land on annual
 boundaries.
+
+Generative objective: linear flow matching, not DDPM
+------------------------------------------------------
+The DiT is trained to predict the velocity `x1 - x0` of the straight-line path
+`x_t = (1-t) x0 + t x1` between the data `x0` and Gaussian noise `x1`, for `t`
+drawn uniformly from `[0, 1]` (Lipman et al.; rectified flow with linear
+interpolation, the simplest member of the flow-matching family). There is no
+noise schedule to choose and no `x0`/`eps` parameterisation question — the
+network output is the velocity, full stop, and sampling is Euler integration
+of `dx/dt = v_theta(x_t, t)` from `t=1` down to `t=0` in `n_flow_steps` steps.
+`DiT1D` is unchanged: "DiT" names the transformer backbone (as in SD3's
+MM-DiT), not the DDPM objective it was originally paired with, and the same
+sinusoidal timestep embedder works for a continuous `t in [0, 1]` once it is
+rescaled by `TIME_EMBED_SCALE` — see `flow_matching_loss`.
 """
 
 import math
@@ -100,14 +114,12 @@ from proto_scales.ssm_dit_model.annual_ssm import (
 from proto_scales.ssm_dit_model.conditioning import ConditioningBuilder
 from proto_scales.ssm_dit_model.dit import DiT1D
 
-
-def cosine_beta_schedule(n_steps, s=0.008):
-    """Nichol & Dhariwal cosine schedule."""
-    t = torch.linspace(0, n_steps, n_steps + 1, dtype=torch.float64) / n_steps
-    f = torch.cos((t + s) / (1.0 + s) * math.pi / 2.0) ** 2
-    alpha_bar = f / f[0]
-    betas = 1.0 - alpha_bar[1:] / alpha_bar[:-1]
-    return betas.clamp(1e-8, 0.999).float()
+# `TimestepEmbedder` (in `dit.py`) is a sinusoidal embedding tuned for
+# integer-ish inputs spanning O(1000) (it was built for DDPM step indices in
+# [0, 1000)). Flow-matching `t` lives in [0, 1], so it is rescaled by this
+# factor before reaching the embedder rather than changing `dit.py` to suit
+# one caller.
+TIME_EMBED_SCALE = 1000.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -394,6 +406,12 @@ class AnnualSSMOutpaintingDiT(nn.Module):
                   window-local and re-zero their EMA on every call, so over a
                   240-month window a 100 yr kernel never leaves its ramp-up
                   transient. Century-scale memory is z's job here.
+    n_flow_steps : default number of Euler steps for the flow-matching ODE at
+                  sampling time (overridable per call via `sample_blocks`'
+                  `n_steps`). Training itself needs no step count — `t` is
+                  continuous on [0, 1] — so this only controls sampling cost
+                  and accuracy; linear flow paths need far fewer steps than a
+                  1000-step DDPM chain.
     """
 
     def __init__(
@@ -408,11 +426,10 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         hidden=384,
         depth=8,
         heads=6,
-        n_diffusion_steps=1000,
+        n_flow_steps=50,
         timescales_years=(1.0, 5.0, 20.0),
         learnable_timescales=True,
         field_memory_rank=32,
-        parameterization="v",
         stochastic_z=False,
         # auxiliary SSM objectives
         ssm_elbo_weight=1.0,
@@ -421,8 +438,6 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         ssm_rollout_weight=1.0,
     ):
         super().__init__()
-        if parameterization not in ("v", "eps"):
-            raise ValueError("parameterization must be 'v' or 'eps'")
         # Whole years, so that to_annual's year boundaries coincide with block
         # boundaries. Without this a block advances the shared rollout by a full
         # year for a fraction of a year of forcing.
@@ -445,8 +460,7 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         self.block_len = int(block_len)
         self.n_total = self.context_len + self.block_len
         self.in_channels = 2 * y_dim
-        self.n_diffusion_steps = int(n_diffusion_steps)
-        self.parameterization = parameterization
+        self.n_flow_steps = int(n_flow_steps)
         self.stochastic_z = bool(stochastic_z)
 
         self.ssm_elbo_weight = float(ssm_elbo_weight)
@@ -474,15 +488,6 @@ class AnnualSSMOutpaintingDiT(nn.Module):
             depth=depth,
             heads=heads,
         )
-
-        betas = cosine_beta_schedule(self.n_diffusion_steps)
-        alphas = 1.0 - betas
-        alpha_bar = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bar", alpha_bar)
-        self.register_buffer("sqrt_ab", alpha_bar.sqrt())
-        self.register_buffer("sqrt_1mab", (1.0 - alpha_bar).sqrt())
 
     # ------------------------------------------------------------------
     # conditioning
@@ -516,29 +521,6 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         mask[:, :n_ctx] = 1.0
         return mask
 
-    def _to_x0_eps(self, pred, x_t, t):
-        """
-        Convert the network output to (x0_hat, eps_hat). `t` is a scalar index.
-
-        With v-parameterisation, v = a*eps - s*x0 and a^2 + s^2 = 1, so the
-        inverse is the rotation x0 = a*x_t - s*v, eps = s*x_t + a*v, which stays
-        well conditioned at every noise level. The eps route divides by a -> 0 at
-        high noise and amplifies any error in eps_hat without bound.
-        """
-        a = self.sqrt_ab[t]
-        s = self.sqrt_1mab[t]
-        if self.parameterization == "v":
-            x0_hat = a * x_t - s * pred
-            eps_hat = s * x_t + a * pred
-        else:
-            eps_hat = pred
-            x0_hat = (x_t - s * eps_hat) / a.clamp(min=1e-8)
-        x0_hat = x0_hat.clamp(-10.0, 10.0)
-        # Re-derive eps from the clamped x0 so the pair stays self-consistent;
-        # an inconsistent (x0, eps) pair injects a bias into the DDIM step.
-        eps_hat = (x_t - a * x0_hat) / s.clamp(min=1e-8)
-        return x0_hat, eps_hat
-
     def block_bounds(self, block_idx, n_fut):
         """
         Absolute month bounds of DiT block `block_idx` inside a super-window
@@ -571,13 +553,18 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         """
         return self.loss(*args, **kwargs)
 
-    def diffusion_loss(self, z_win, u_win, field_win, n_block, start_month,
-                       t_diff=None):
+    def flow_matching_loss(self, z_win, u_win, field_win, n_block, start_month,
+                           t=None):
         """
-        Diffusion loss on the generated positions of one window.
+        Linear flow-matching loss on the generated positions of one window:
+        predict the velocity `x1 - x0` of the straight-line path between the
+        data `x0` and Gaussian noise `x1` at a `t` drawn uniformly from
+        `[0, 1]`. Constant along the path, so there is one target regardless
+        of `t` — unlike a DDPM target, which depends on the noise schedule at
+        `t`.
 
-        The context positions are held at their clean values throughout, so the
-        denoiser always sees an intact history — that is the outpainting
+        The context positions are held at their clean values throughout, so
+        the denoiser always sees an intact history — that is the outpainting
         condition, and it is what the model sees at sampling time.
         """
         B = field_win.shape[0]
@@ -591,16 +578,15 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         x0 = field_win
         mask = self._mask(B, n_ctx, n_total, device)
 
-        if t_diff is None:
-            t_diff = torch.randint(0, self.n_diffusion_steps, (B,), device=device)
-        eps = torch.randn_like(x0)
-        a = self.sqrt_ab[t_diff].view(B, 1, 1)
-        s = self.sqrt_1mab[t_diff].view(B, 1, 1)
-        x_noisy = a * x0 + s * eps
-        x_in = mask * x0 + (1.0 - mask) * x_noisy
+        if t is None:
+            t = torch.rand(B, device=device)
+        x1 = torch.randn_like(x0)
+        t_bc = t.view(B, 1, 1)
+        x_t = (1.0 - t_bc) * x0 + t_bc * x1
+        x_in = mask * x0 + (1.0 - mask) * x_t
 
-        pred = self.dit(x_in, t_diff, cond, mask)
-        target = (a * eps - s * x0) if self.parameterization == "v" else eps
+        pred = self.dit(x_in, t * TIME_EMBED_SCALE, cond, mask)
+        target = x1 - x0
 
         gen = 1.0 - mask
         denom = gen.sum() * x0.shape[-1]
@@ -612,7 +598,7 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         the same DDP reduction.
 
         ELBO     keeps z a genuine latent state of the data rather than whatever
-                 the diffusion loss finds convenient, one year ahead;
+                 the flow-matching loss finds convenient, one year ahead;
         rollout  is the only term that scores the many-step operator the sampler
                  actually iterates. Without it, century rollouts are an
                  unsupervised extrapolation from a next-year fit.
@@ -644,11 +630,11 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         return total, parts
 
     def loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut,
-             block_idx=(0,), start_month=0, t_diff=None, return_parts=False):
+             block_idx=(0,), start_month=0, t=None, return_parts=False):
         """
         Loss over a super-window: `context_len` observed months plus a long
-        future, with the diffusion term evaluated on the DiT blocks listed in
-        `block_idx`.
+        future, with the flow-matching term evaluated on the DiT blocks listed
+        in `block_idx`.
 
         z is rolled once over the whole future and each block reads its slice, so
         blocks late in `block_idx` are trained on latents that carry the full
@@ -671,29 +657,29 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         elif isinstance(block_idx, int):
             block_idx = [block_idx]
 
-        diff_terms = []
+        flow_terms = []
         per_block = {}
         for bi in block_idx:
             w0, bs, nb = self.block_bounds(bi, n_fut)
             win = slice(w0, bs + nb)
-            d = self.diffusion_loss(
+            d = self.flow_matching_loss(
                 z_win=z_all[:, win],
                 u_win=u_all[:, win],
                 field_win=field_all[:, win],
                 n_block=nb,
                 start_month=(int(start_month) + w0) % MONTHS_PER_YEAR,
-                t_diff=t_diff,
+                t=t,
             )
-            diff_terms.append(d)
+            flow_terms.append(d)
             # Reported per block so one call can show the drift with lead time;
             # recomputing the loss per block would redo the ELBO and the rollout.
-            per_block[f"diff_blk{int(bi)}"] = d.detach()
-        diff_loss = torch.stack(diff_terms).mean()
+            per_block[f"flow_blk{int(bi)}"] = d.detach()
+        flow_loss = torch.stack(flow_terms).mean()
 
-        parts = {"diffusion": diff_loss.detach()}
+        parts = {"flow_matching": flow_loss.detach()}
         if len(per_block) > 1:
             parts.update(per_block)
-        total = diff_loss
+        total = flow_loss
         if self.use_ssm_aux:
             aux, aux_parts = self.ssm_aux_loss(
                 tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut)
@@ -708,7 +694,14 @@ class AnnualSSMOutpaintingDiT(nn.Module):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _sample_window(self, cond, field_ctx, n_block, n_steps=None, generator=None):
-        """Ancestral/DDIM sampling of one block. Returns [B, n_block, 2*y_dim]."""
+        """
+        Euler integration of the flow-matching ODE for one block, from `t=1`
+        (noise) down to `t=0` (data). Returns [B, n_block, 2*y_dim].
+
+        Deterministic given `generator`: unlike DDIM, plain Euler on a linear
+        path has no free noise-injection term to make a sampler ancestral, so
+        there is nothing analogous to `sigma` here.
+        """
         B = field_ctx.shape[0]
         device = field_ctx.device
         n_ctx = field_ctx.shape[1]
@@ -720,23 +713,14 @@ class AnnualSSMOutpaintingDiT(nn.Module):
         x = torch.randn(B, n_total, self.in_channels, device=device, generator=generator)
         x = mask * obs + (1.0 - mask) * x
 
-        total = self.n_diffusion_steps
-        n_steps = total if n_steps is None else int(n_steps)
-        step_idx = torch.linspace(total - 1, 0, n_steps, device=device).long()
+        n_steps = self.n_flow_steps if n_steps is None else int(n_steps)
+        ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
 
-        for i, t in enumerate(step_idx):
-            pred = self.dit(x, t.repeat(B), cond, mask)
-            ab_t = self.alpha_bar[t]
-            x0_hat, eps_hat = self._to_x0_eps(pred, x, t)
-
-            if i < len(step_idx) - 1:
-                ab_prev = self.alpha_bar[step_idx[i + 1]]
-                sigma = ((1 - ab_prev) / (1 - ab_t)).sqrt() * (1 - ab_t / ab_prev).sqrt()
-                dir_xt = (1 - ab_prev - sigma**2).clamp(min=0).sqrt() * eps_hat
-                noise = torch.randn(x.shape, device=device, generator=generator)
-                x = ab_prev.sqrt() * x0_hat + dir_xt + sigma * noise
-            else:
-                x = x0_hat
+        for i in range(n_steps):
+            t_cur = ts[i]
+            dt = t_cur - ts[i + 1]
+            v_hat = self.dit(x, t_cur.repeat(B) * TIME_EMBED_SCALE, cond, mask)
+            x = x - dt * v_hat
 
             # re-impose the observed context at every step
             x = mask * obs + (1.0 - mask) * x
