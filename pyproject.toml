@@ -30,7 +30,8 @@ dependencies = [
   "pyomo",
   "regionmask",
   "xarray[io]",
-  "pandas==2.3.2",
+  "pandas==3.0.5",
+  "scikit-learn",
   "nc-time-axis>=1.2.0",
   "paramiko"
 ]
