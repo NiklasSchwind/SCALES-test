@@ -1,20 +1,10 @@
 """
-Training loop for `annual_jepa_dit.AnnualJEPAOutpaintingDiT`.
+Training loop for `annual_jepa_kl_dit.AnnualJEPAKLOutpaintingDiT`.
 
-Identical to `annual_dit_training` — same windowed dataset, same model-wide
-sampling EMA — with two additions:
-
-* the JEPA latent process carries its own target-encoder EMA, updated once
-  per optimiser step via `ForcedAnnualJEPA.update_target_encoder`,
-  independently of and in parallel with the sampling EMA (see
-  `annual_jepa_dit.ForcedAnnualJEPA` for why it needs one);
-* `weight_decay` defaults to `1e-4` rather than `0.0` — with no emission term
-  to ground the transition (see `annual_jepa_kl_dit`'s module docstring),
-  nothing else discourages `logit_decay`/`B` drifting to a degenerate
-  saturated point, and AdamW's weight decay applies to every trainable
-  parameter including those. `ForcedAnnualJEPA.decay()` also now hard-clamps
-  to `decay_efold_range`, so this is a second, independent guard against the
-  same failure, not the only one.
+Identical to `annual_jepa_dit_training` — same windowed dataset, same
+model-wide sampling EMA, same per-step target-encoder EMA via
+`ForcedAnnualJEPAKL.update_target_encoder` — with the one-step auxiliary term
+being the KL loss described in `annual_jepa_kl_dit` instead of the plain MSE.
 """
 
 import math
@@ -29,7 +19,7 @@ from torch.utils.data import DataLoader
 
 import proto_scales.ssm_model.scales_ssm as scales_ssm
 from proto_scales.ssm_dit_model.annual_dit_training import LongHorizonWindowDataset, ModelEMA
-from proto_scales.ssm_dit_model.annual_jepa_dit import AnnualJEPAOutpaintingDiT, ForcedAnnualJEPA
+from proto_scales.ssm_dit_model.annual_jepa_kl_dit import AnnualJEPAKLOutpaintingDiT, ForcedAnnualJEPAKL
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
 
 
@@ -52,9 +42,9 @@ def run_train(
     batch_size=8,
     epochs=200,
     lr=1e-4,
-    weight_decay=1e-4,
+    weight_decay=0.0,
     warmup_steps=500,
-    # JEPA latent process
+    # JEPA-KL latent process
     jepa_weights=None,
     scaler_run_dir=None,
     freeze_jepa=False,
@@ -65,6 +55,7 @@ def run_train(
     target_decay=0.996,
     jepa_weight=1.0,
     jepa_rollout_weight=1.0,
+    jepa_kl_free_bits=0.05,
     # DiT
     cond_dim=256,
     hidden=384,
@@ -88,10 +79,10 @@ def run_train(
     Returns (ema_model, tas_scaler, pr_scaler, u_scaler).
 
     The returned model is the model-wide sampling EMA copy, exactly as in
-    `annual_dit_training.run_train` — that is the one to sample from. The JEPA
-    target encoder's own EMA lives inside the raw (non-EMA) model; it only
-    ever shapes what the raw model, and therefore the sampling EMA, learns to
-    predict, and is not itself returned.
+    `annual_jepa_dit_training.run_train` — that is the one to sample from. The
+    JEPA-KL target encoder's own EMA lives inside the raw (non-EMA) model; it
+    only ever shapes what the raw model, and therefore the sampling EMA,
+    learns to predict, and is not itself returned.
     """
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     use_cuda = torch.cuda.is_available()
@@ -147,7 +138,7 @@ def run_train(
     Dy = tas_np.shape[-1]
     Du = u_np.shape[-1]
 
-    jepa = ForcedAnnualJEPA(
+    jepa = ForcedAnnualJEPAKL(
         obs_dim=2 * Dy, u_dim=Du, z_dim=z_dim, rnn_hidden=rnn_hidden,
         trans_hidden=trans_hidden, decay_efold_range=decay_efold_range,
         target_decay=target_decay,
@@ -161,7 +152,7 @@ def run_train(
     elif is_main:
         print("[jepa] no checkpoint given — latent process starts from random init")
 
-    raw_model = AnnualJEPAOutpaintingDiT(
+    raw_model = AnnualJEPAKLOutpaintingDiT(
         jepa=jepa, y_dim=Dy, u_dim=Du,
         context_len=context_len, block_len=block_len, freeze_ssm=freeze_jepa,
         cond_dim=cond_dim, hidden=hidden, depth=depth, heads=heads,
@@ -171,6 +162,7 @@ def run_train(
         field_memory_rank=field_memory_rank,
         jepa_weight=jepa_weight,
         jepa_rollout_weight=jepa_rollout_weight,
+        jepa_kl_free_bits=jepa_kl_free_bits,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -183,11 +175,11 @@ def run_train(
         print(f"[model] z e-folding times (yr): "
               f"{[round(v, 1) for v in jepa.efolding_years().tolist()]}")
         if raw_model.use_ssm_aux:
-            print(f"[model] JEPA auxiliary objective ON (weight={jepa_weight}, "
+            print(f"[model] JEPA-KL auxiliary objective ON (weight={jepa_weight}, "
                   f"rollout_weight={jepa_rollout_weight}, "
-                  f"target_decay={target_decay})")
+                  f"kl_free_bits={jepa_kl_free_bits}, target_decay={target_decay})")
         elif not freeze_jepa:
-            print("[model] WARNING: JEPA latent process is trainable but has no "
+            print("[model] WARNING: JEPA-KL latent process is trainable but has no "
                   "auxiliary objective. z is shaped by the flow-matching loss "
                   "alone, and nothing scores the multi-step rollout the sampler "
                   "iterates.")
@@ -287,7 +279,7 @@ def run_train(
             ema.update(raw_model)
             # Target-encoder EMA: independent of the sampling EMA above and
             # updated every step regardless of it, since it is what keeps the
-            # JEPA loss from collapsing rather than what gets sampled from.
+            # JEPA-KL loss from collapsing rather than what gets sampled from.
             if not raw_model.ssm_encoder.frozen:
                 raw_model.ssm_encoder.ssm.update_target_encoder()
 
@@ -322,8 +314,8 @@ def run_train(
         if not tr_losses:
             raise RuntimeError(
                 f"epoch {epoch}: every step was skipped as non-finite. The model "
-                f"has diverged; lower --lr, --jepa_weight or "
-                f"--jepa_rollout_weight.")
+                f"has diverged; lower --lr, --jepa_weight, --jepa_rollout_weight "
+                f"or --jepa_kl_free_bits.")
         tr_mean = float(np.mean(tr_losses))
         va_mean = float(np.mean(va_losses)) if va_losses else float("nan")
         if is_main:
@@ -341,7 +333,7 @@ def run_train(
             ckpt_dir = os.path.join(run_dir, "checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
             torch.save({"model": raw_model.state_dict(), "ema": ema.state_dict()},
-                       os.path.join(ckpt_dir, f"annual_jepa_dit_epoch{epoch:04d}.pt"))
+                       os.path.join(ckpt_dir, f"annual_jepa_kl_dit_epoch{epoch:04d}.pt"))
 
     if best_state is not None:
         ema.shadow.load_state_dict(best_state)

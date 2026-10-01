@@ -92,12 +92,18 @@ class ForcedAnnualJEPA(nn.Module):
 
     Parameters
     ----------
-    decay_efold_range : e-folding times in YEARS spanned at initialisation.
-                        Same parameterisation as `ForcedAnnualSSM`: a
-                        per-dimension contraction through a sigmoid so every
-                        eigenvalue is real and in (0, 1) and a long rollout
-                        cannot ring or diverge. See that module's docstring
-                        for why a dense `A` is deliberately not offered.
+    decay_efold_range : e-folding times in YEARS, both spanned at
+                        initialisation *and enforced for the life of
+                        training* — `decay()` clamps to this range always,
+                        unlike `ForcedAnnualSSM` where it is only an init
+                        range. Per-dimension contraction through a sigmoid so
+                        every eigenvalue is real and in (0, 1) and a long
+                        rollout cannot ring or diverge; see that module's
+                        docstring for why a dense `A` is deliberately not
+                        offered, and see `annual_jepa_kl_dit`'s module
+                        docstring for why nothing here otherwise stops
+                        `logit_decay` drifting to the sigmoid's saturation
+                        ceiling without this clamp.
     trans_hidden      : optional MLP correction on the transition mean, as in
                         `ForcedAnnualSSM`.
     target_decay      : EMA decay for `target_encoder`. Deliberately lower
@@ -144,6 +150,18 @@ class ForcedAnnualJEPA(nn.Module):
         tau = torch.logspace(math.log10(lo), math.log10(hi), z_dim)
         d0 = torch.exp(-1.0 / tau).clamp(1e-4, 1 - 1e-4)
         self.logit_decay = nn.Parameter(torch.log(d0 / (1.0 - d0)))
+
+        # `decay()` clamps to exactly this range forever after, not just at
+        # init: with no emission term to penalise a degenerate transition
+        # (see `annual_jepa_kl_dit`'s module docstring), nothing else stops
+        # `logit_decay` drifting to the sigmoid's saturation ceiling, where
+        # `efolding_years()` reports tens of thousands of years instead of
+        # the intended 1..50. The clamp also zeroes the gradient once `decay`
+        # hits either bound, which stops that drift rather than merely
+        # slowing it.
+        self.register_buffer("_decay_min", torch.tensor(math.exp(-1.0 / lo)))
+        self.register_buffer("_decay_max", torch.tensor(math.exp(-1.0 / hi)))
+
         self.B = nn.Linear(u_dim, z_dim, bias=False)
         self.trans_mlp = (
             nn.Sequential(nn.Linear(z_dim + u_dim, trans_hidden), nn.SiLU(),
@@ -155,7 +173,7 @@ class ForcedAnnualJEPA(nn.Module):
     # pieces
     # -----------------------
     def decay(self):
-        return torch.sigmoid(self.logit_decay)
+        return torch.sigmoid(self.logit_decay).clamp(self._decay_min, self._decay_max)
 
     def efolding_years(self):
         """Per-dimension e-folding times in years — the thing to inspect."""
