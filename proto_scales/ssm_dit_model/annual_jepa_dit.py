@@ -56,13 +56,17 @@ window-local.
 """
 
 import copy
+import glob
 import math
+import os
+import re
 
 import torch
 import torch.nn as nn
 
 from proto_scales.ssm_dit_model.annual_ssm import to_annual
 from proto_scales.ssm_dit_model.annual_ssm_dit import AnnualSSMOutpaintingDiT
+from proto_scales.ssm_model.scales_ssm import StandardScaler
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,3 +336,76 @@ def build_model(y_dim, u_dim, device="cpu", jepa_weights=None, **kwargs):
 
     model = AnnualJEPAOutpaintingDiT(jepa=jepa, y_dim=y_dim, u_dim=u_dim, **kwargs)
     return model.to(device)
+
+
+_CKPT_EPOCH_RE = re.compile(r"annual_jepa_dit_epoch(\d+)\.pt$")
+
+
+def load_jepa_dit_annual(run_dir, y_dim, u_dim=1, device="gpu", ema=True, **model_kwargs):
+    """
+    Load a trained `AnnualJEPAOutpaintingDiT` plus its tas/pr/u scalers from a
+    `train_annual_jepa_dit.py` run directory.
+
+    Checkpoint selection
+    --------------------
+    `run_dir/checkpoints/annual_jepa_dit_epoch*.pt` (written periodically by
+    `annual_jepa_dit_training.run_train`, every `--ckpt_every` epochs) holds
+    both `{"model": ..., "ema": ...}` for its epoch. If any exist, the highest
+    epoch is used and `ema` picks which of the two state dicts to load.
+
+    `run_dir/model_out` (written once, at the end of training) is already the
+    best-validation *EMA* shadow's state dict — there is no raw counterpart
+    saved there, only inside the periodic checkpoints. So if no
+    `checkpoints/` directory exists, `ema=False` cannot be honoured and raises
+    rather than silently handing back EMA weights anyway.
+
+    `y_dim`/`u_dim` and any architecture kwargs (`z_dim`, `hidden`, `depth`,
+    `context_len`, ... — anything `build_model` accepts) must match what the
+    run was trained with; this function does not read `config.txt` to infer
+    them, since nothing else in this codebase does either (see
+    `train_annual_jepa_dit.py`'s own `config.txt` for the values actually
+    used). Mismatched architecture kwargs surface as a `load_state_dict`
+    shape error.
+
+    `device="gpu"` is translated to `"cuda"` (falling back to `"cpu"` with a
+    warning if no GPU is visible); any other string is passed through as-is.
+
+    Returns (model, tas_scaler, pr_scaler, u_scaler). `model` is already in
+    `eval()` mode.
+    """
+    if device in ("gpu", "cuda"):
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            print("[load_jepa_dit_annual] no GPU visible, falling back to CPU")
+            device = "cpu"
+
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    ckpt_files = glob.glob(os.path.join(ckpt_dir, "annual_jepa_dit_epoch*.pt"))
+
+    if ckpt_files:
+        latest = max(ckpt_files, key=lambda p: int(_CKPT_EPOCH_RE.search(p).group(1)))
+        ckpt = torch.load(latest, map_location="cpu")
+        state_dict = ckpt["ema" if ema else "model"]
+        print(f"[load_jepa_dit_annual] loaded {'ema' if ema else 'model'} weights "
+              f"from {latest}")
+    else:
+        if not ema:
+            raise ValueError(
+                f"{run_dir} has no checkpoints/ directory, only the final "
+                f"model_out — which is already the EMA shadow, so ema=False "
+                f"cannot be satisfied. Re-run training with periodic "
+                f"checkpointing (--ckpt_every) if the raw weights are needed.")
+        state_dict = torch.load(os.path.join(run_dir, "model_out"), map_location="cpu")
+        print(f"[load_jepa_dit_annual] loaded ema weights from "
+              f"{os.path.join(run_dir, 'model_out')}")
+
+    model = build_model(y_dim, u_dim, device=device, **model_kwargs)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    tas_scaler = StandardScaler.from_file(os.path.join(run_dir, "y_scaler.out"))
+    pr_scaler = StandardScaler.from_file(os.path.join(run_dir, "pr_scaler.out"))
+    u_scaler = StandardScaler.from_file(os.path.join(run_dir, "u_scaler.out"))
+
+    return model, tas_scaler, pr_scaler, u_scaler
