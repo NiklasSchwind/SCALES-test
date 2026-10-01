@@ -1,22 +1,23 @@
 """
-Train the annual-JEPA-conditioned outpainting DiT (`annual_jepa_dit`).
+Train the annual-JEPA-KL-conditioned outpainting DiT (`annual_jepa_kl_dit`).
 
-Data loading is identical to `train_annual_ssm_dit.py` / `train_ssm_dit.py`,
-so all these models are trained on the same arrays.
+Data loading is identical to `train_annual_jepa_dit.py` / `train_annual_ssm_dit.py`
+/ `train_ssm_dit.py`, so all these models are trained on the same arrays.
 
 Typical use — the latent process is trained jointly with the DiT, so there is
 no separate pretraining step to run first:
 
-    torchrun --nproc_per_node=1 -m proto_scales.train_annual_jepa_dit --cluster ASC
+    torchrun --nproc_per_node=1 -m proto_scales.train_annual_jepa_kl_dit --cluster ASC
 
 The defaults train on 100-year futures with two DiT blocks scored per step. The
 super-window is `context_len + horizon` months and trajectories are only
 `N` months long (1800 = 150 yr), which is the hard ceiling on `--horizon`.
 
 --scaler_run_dir only reuses scalers from an earlier run; the latent process
-here is a `ForcedAnnualJEPA` and is not checkpoint-compatible with either the
-monthly SSM, the oscillatory `AnnualSSM`, or the emission-based
-`ForcedAnnualSSM` that `train_annual_ssm_dit.py` trains.
+here is a `ForcedAnnualJEPAKL` and is not checkpoint-compatible with the
+monthly SSM, the oscillatory `AnnualSSM`, the emission-based `ForcedAnnualSSM`
+that `train_annual_ssm_dit.py` trains, or the plain-MSE `ForcedAnnualJEPA`
+that `train_annual_jepa_dit.py` trains.
 """
 
 import argparse
@@ -30,7 +31,7 @@ import pandas as pd
 import torch
 
 import proto_scales.data_prep.prepare_data as prep
-import proto_scales.ssm_dit_model.annual_jepa_dit_training as dit_training
+import proto_scales.ssm_dit_model.annual_jepa_kl_dit_training as dit_training
 
 MODEL = 'ACCESS-ESM1-5'
 INDICATORS = ['tas', 'pr']
@@ -114,14 +115,14 @@ if __name__ == "__main__":
     _local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     p = argparse.ArgumentParser(
-        description="Annual-JEPA-conditioned outpainting DiT for climate projections")
+        description="Annual-JEPA-KL-conditioned outpainting DiT for climate projections")
     p.add_argument("--cluster", type=str, help="Cluster name ASC or IIASA")
     p.add_argument("--add_data", nargs="+", type=str, default=[])
     p.add_argument("--rm_data", nargs="+", type=str, default=[])
 
     # latent process
     p.add_argument("--jepa_weights", type=str, default=None,
-                   help="Warm-start weights for the ForcedAnnualJEPA only")
+                   help="Warm-start weights for the ForcedAnnualJEPAKL only")
     p.add_argument("--scaler_run_dir", type=str, default=None,
                    help="Reuse y/pr/u scalers from an earlier run directory")
     p.add_argument("--freeze_jepa", action="store_true",
@@ -136,11 +137,11 @@ if __name__ == "__main__":
     p.add_argument("--target_decay", type=float, default=0.996,
                    help="EMA decay for the JEPA target encoder. Kept lower than --ema_decay: an encoder that changes too slowly leaves the predictor chasing a stale target early in training")
     p.add_argument("--jepa_weight", type=float, default=1.0,
-                   help="One-step-ahead JEPA loss. Normalised per element, so on the same scale as the diffusion loss")
+                   help="One-step-ahead JEPA-KL loss. Normalised per (year x z-dim), so on the same scale as the diffusion loss")
     p.add_argument("--jepa_rollout_weight", type=float, default=1.0,
-                   help="Multi-step rollout consistency in representation space. This is the only term that scores the many-step operator the sampler iterates; at 0, century rollouts are an unsupervised extrapolation from a next-year fit")
-    p.add_argument("--jepa_cov_weight", type=float, default=1.0,
-                   help="VICReg-style covariance penalty on the online encoding: guards against z-dimensions collapsing onto redundant copies of each other (different from magnitude collapse, which decay_efold_range's clamp and --weight_decay guard against)")
+                   help="Multi-step rollout consistency in representation space (plain MSE, unchanged from the non-KL JEPA model). This is the only term that scores the many-step operator the sampler iterates; at 0, century rollouts are an unsupervised extrapolation from a next-year fit")
+    p.add_argument("--jepa_kl_free_bits", type=float, default=0.05,
+                   help="Per-dimension KL floor for the one-step term, same role as --ssm_kl_free_bits in the ELBO model: insurance against the posterior trivially matching the prior on dimensions that have nothing to say")
 
     # DiT
     p.add_argument("--context_len", type=int, default=120,
@@ -167,8 +168,7 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-4,
-                   help="Nonzero by default here (unlike the ELBO/KL scripts): with no emission term grounding the transition, nothing else discourages logit_decay/B drifting to a degenerate saturated point, and AdamW applies this to every parameter including those")
+    p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_steps", type=int, default=500)
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--stride", type=int, default=7,
@@ -189,7 +189,7 @@ if __name__ == "__main__":
     print("tas", tas.shape, "pr", pr.shape, "GMT", u.shape)
 
     run_dir = os.path.join("outputs_ssm_scales",
-                           "annual_jepa_dit_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+                           "annual_jepa_kl_dit_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "train_scenarios.txt"), "w") as f:
         f.write("\n".join(TRAIN_SCENARIOS))
@@ -212,7 +212,7 @@ if __name__ == "__main__":
             target_decay=args.target_decay,
             jepa_weight=args.jepa_weight,
             jepa_rollout_weight=args.jepa_rollout_weight,
-            jepa_cov_weight=args.jepa_cov_weight,
+            jepa_kl_free_bits=args.jepa_kl_free_bits,
             cond_dim=args.cond_dim, hidden=args.hidden, depth=args.depth,
             heads=args.heads, n_flow_steps=args.n_flow_steps,
             timescales_years=tuple(args.timescales),

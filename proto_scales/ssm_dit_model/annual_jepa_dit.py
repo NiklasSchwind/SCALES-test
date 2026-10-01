@@ -41,6 +41,34 @@ cannot do that, so the diffusion loss pulls against collapse from the other
 side. The target encoder removes the trivial optimum outright rather than
 relying on that alone.
 
+Two collapse modes, two separate guards
+------------------------------------------
+The target encoder above prevents the *trivial* optimum (encoder collapses to
+a literal constant), but that turned out not to be the only degenerate
+solution available without an emission term:
+
+* **Magnitude collapse.** Nothing stops `logit_decay` drifting to the
+  sigmoid's saturation ceiling (observed in practice: e-folding times in the
+  tens of thousands of years, instead of the intended 1..50) paired with a
+  near-zero `B`, i.e. a transition that barely responds to forcing at all.
+  `decay()` now hard-clamps to `decay_efold_range` for the life of training,
+  not just at init, which also zeroes the gradient once a dimension hits
+  either bound — removing the incentive to keep drifting, not just the
+  symptom. (`weight_decay` defaulting to `1e-4` rather than `0.0` in
+  `annual_jepa_dit_training` is a second, cheap, global guard against the
+  same drift.)
+* **Dimensional collapse.** Even with the clamp and healthy, large `B` rows,
+  most z-dimensions can still converge onto the *same* long-e-folding
+  strategy — redundant copies rather than independent timescales, since
+  nothing in `jepa_loss` rewards the dimensions for dividing up the work.
+  `z_covariance_loss` penalises exactly this: off-diagonal covariance between
+  z-dimensions, pooled over batch and time, VICReg-style.
+
+Both were found empirically on this model, in that order — fixing magnitude
+collapse revealed the dimensional collapse underneath it, which a clamp on
+`decay` alone cannot touch, since it is about *agreement between dimensions*,
+not the magnitude of any one of them.
+
 What is unchanged from `annual_ssm_dit`
 -----------------------------------------
 The transition (`decay() * z_prev + B(u_t)`, optionally `+ trans_mlp`), the
@@ -267,6 +295,35 @@ class ForcedAnnualJEPA(nn.Module):
         )[:, y_ctx.shape[1]:]
         return ((z_traj - z_target_fut) ** 2).mean()
 
+    def z_covariance_loss(self, y, u):
+        """
+        VICReg-style covariance penalty on the online encoding, pooled over
+        batch and time: penalises z-dimensions for being linearly *redundant*
+        with each other, as distinct from VICReg's variance term (which
+        guards against a dimension going flat/constant — not needed here;
+        `jepa_loss` combined with `decay()`'s hard clamp already keeps z
+        genuinely forced-response-driven, see `transition_weight_summary`).
+
+        Without this, nothing in the training objective rewards the z
+        dimensions for actually spanning different timescales: the cheapest
+        way to minimise a plain one-step prediction loss on data dominated by
+        a single slow multi-decadal trend is for most dimensions to converge
+        onto the *same* long-e-folding strategy — an implicit ensemble of
+        redundant copies that reduces averaged prediction error without
+        costing anything, since nothing penalises redundancy between
+        dimensions. That defeats the point of giving the transition several
+        independent timescales in the first place, and is a different failure
+        mode from the magnitude collapse `decay_efold_range`'s clamp guards
+        against: dimensions can be large and well-driven (healthy `B` rows)
+        while still being near-copies of each other.
+        """
+        z = self.encode(y, u).reshape(-1, self.z_dim)
+        z = z - z.mean(dim=0, keepdim=True)
+        n = z.shape[0]
+        cov = (z.T @ z) / max(n - 1, 1)
+        off_diag = cov - torch.diag(torch.diagonal(cov))
+        return (off_diag ** 2).sum() / self.z_dim
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
@@ -283,10 +340,17 @@ class AnnualJEPAOutpaintingDiT(AnnualSSMOutpaintingDiT):
     `jepa_weight` / `jepa_rollout_weight` replace `ssm_elbo_weight` /
     `ssm_kl_weight` / `ssm_kl_free_bits` / `ssm_rollout_weight`: there is no KL
     term to weight because there is no prior to regularise against.
+
+    `jepa_cov_weight` adds `ForcedAnnualJEPA.z_covariance_loss` — a guard
+    against *dimensional* collapse (z-dimensions converging onto redundant
+    copies of each other) that the ELBO doesn't need a counterpart for: the
+    emission term there already forces different z-dimensions to be useful in
+    different ways, since a decoder that could drop a redundant dimension for
+    free would have no reason not to.
     """
 
     def __init__(self, jepa, y_dim, u_dim, jepa_weight=1.0,
-                 jepa_rollout_weight=1.0, **kwargs):
+                 jepa_rollout_weight=1.0, jepa_cov_weight=1.0, **kwargs):
         super().__init__(
             ssm=jepa, y_dim=y_dim, u_dim=u_dim,
             ssm_elbo_weight=0.0, ssm_kl_weight=0.0, ssm_kl_free_bits=0.0,
@@ -294,8 +358,10 @@ class AnnualJEPAOutpaintingDiT(AnnualSSMOutpaintingDiT):
         )
         self.jepa_weight = float(jepa_weight)
         self.jepa_rollout_weight = float(jepa_rollout_weight)
+        self.jepa_cov_weight = float(jepa_cov_weight)
         self.use_ssm_aux = (not self.ssm_encoder.frozen) and (
-            self.jepa_weight > 0 or self.jepa_rollout_weight > 0)
+            self.jepa_weight > 0 or self.jepa_rollout_weight > 0
+            or self.jepa_cov_weight > 0)
 
     def ssm_aux_loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut):
         """
@@ -309,13 +375,13 @@ class AnnualJEPAOutpaintingDiT(AnnualSSMOutpaintingDiT):
         y_ctx_ann, u_ctx_ann, u_fut_ann = enc.annual_inputs(
             tas_ctx, pr_ctx, u_ctx, u_fut)
         y_fut_ann = to_annual(torch.cat([tas_fut, pr_fut], dim=-1))
+        y_ann = torch.cat([y_ctx_ann, y_fut_ann], dim=1)
+        u_ann = torch.cat([u_ctx_ann, u_fut_ann], dim=1)
 
         parts = {}
         total = torch.zeros((), device=y_ctx_ann.device)
 
         if self.jepa_weight > 0:
-            y_ann = torch.cat([y_ctx_ann, y_fut_ann], dim=1)
-            u_ann = torch.cat([u_ctx_ann, u_fut_ann], dim=1)
             jepa = enc.ssm.jepa_loss(y_ann, u_ann)
             total = total + self.jepa_weight * jepa
             parts["jepa"] = jepa.detach()
@@ -325,6 +391,11 @@ class AnnualJEPAOutpaintingDiT(AnnualSSMOutpaintingDiT):
                 y_ctx_ann, u_ctx_ann, y_fut_ann, u_fut_ann)
             total = total + self.jepa_rollout_weight * roll
             parts["jepa_rollout"] = roll.detach()
+
+        if self.jepa_cov_weight > 0:
+            cov = enc.ssm.z_covariance_loss(y_ann, u_ann)
+            total = total + self.jepa_cov_weight * cov
+            parts["jepa_cov"] = cov.detach()
 
         return total, parts
 

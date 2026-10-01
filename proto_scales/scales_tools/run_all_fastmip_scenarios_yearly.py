@@ -374,9 +374,13 @@ def plot_average_climate_change(out_tas_nc, out_pr_nc, year_range,
     lon, lat, tas_grid = _region_value_grid(tas_values)
     _, _, pr_grid = _region_value_grid(pr_values)
 
+    # Robinson rather than PlateCarree: a non-rectangular whole-world
+    # projection, so area near the poles isn't stretched into a full-width
+    # band the way an equirectangular map does. The data stays in plain
+    # lon/lat, reprojected via `transform=ccrs.PlateCarree()` in `pcolormesh`.
     fig, axes = plt.subplots(
         1, 2, figsize=(15, 5.5), dpi=150,
-        subplot_kw={"projection": ccrs.PlateCarree()},
+        subplot_kw={"projection": ccrs.Robinson()},
     )
     panels = [
         (axes[0], tas_grid, "RdBu_r", "tas anomaly [K]"),
@@ -403,6 +407,15 @@ def plot_average_climate_change(out_tas_nc, out_pr_nc, year_range,
         if have_natural_earth:
             ax.coastlines(linewidth=0.5)
             ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.5)
+        # AR6 region outlines, from the same polygons used to rasterise the
+        # grid — crisp boundaries rather than the blocky edges the raster
+        # alone gives at 1 degree resolution. Pure geometry, no shapefile
+        # download, so this draws regardless of `have_natural_earth`.
+        ax.add_geometries(
+            [region.polygon for region in AR6_REGIONS],
+            crs=ccrs.PlateCarree(), facecolor="none", edgecolor="black",
+            linewidth=0.4,
+        )
         ax.set_global()
         cb = fig.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.8)
         cb.set_label(label, fontsize=11)
@@ -524,6 +537,82 @@ def plot_yearly_stats_across_esm_fastmip(out_tas_nc, out_pr_nc, region_sel="EAS"
             .replace("_SCALES_regional_quantiles-across-ESM.nc", "")
         )
         fig_path = os.path.join(save_dir, f"{scenario_tag}_{region_sel}_yearly_stats_across_ESM.png")
+        plt.savefig(fig_path, dpi=150)
+        print(f"Plot saved -> {fig_path}", flush=True)
+    plt.close(fig)
+    ds_tas.close()
+    ds_pr.close()
+
+
+def plot_average_climate_change_across_esm(out_tas_nc, out_pr_nc, year_range, save_dir=None):
+    """
+    Same as `plot_average_climate_change`, but for `out_tas_nc`/`out_pr_nc`
+    from `compute_yearly_stats_across_esm_for_fastmip` instead of the by-ESM
+    output — one multi-model-spread map per variable rather than one per ESM
+    calibration, so there is no `esm_calibration` to select.
+    """
+    ds_tas = xr.open_dataset(out_tas_nc)
+    ds_pr = xr.open_dataset(out_pr_nc)
+
+    year_start, year_end = year_range
+    year_sel = slice(year_start, year_end)
+    tas_avg = ds_tas["tas_mean"].sel(year=year_sel).mean("year")
+    pr_avg = ds_pr["pr_mean"].sel(year=year_sel).mean("year")
+
+    tas_values = dict(zip(tas_avg.mask.values.tolist(), tas_avg.values.tolist()))
+    pr_values = dict(zip(pr_avg.mask.values.tolist(), pr_avg.values.tolist()))
+
+    lon, lat, tas_grid = _region_value_grid(tas_values)
+    _, _, pr_grid = _region_value_grid(pr_values)
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(15, 5.5), dpi=150,
+        subplot_kw={"projection": ccrs.Robinson()},
+    )
+    panels = [
+        (axes[0], tas_grid, "RdBu_r", "tas anomaly [K]"),
+        (axes[1], pr_grid, "BrBG", "pr anomaly [kg m⁻² s⁻¹]"),
+    ]
+    try:
+        list(cfeature.COASTLINE.with_scale("110m").geometries())
+        have_natural_earth = True
+    except Exception as e:
+        have_natural_earth = False
+        print(f"[plot_average_climate_change_across_esm] Natural Earth "
+              f"coastlines/borders unavailable (no cache, no network?): {e}. "
+              f"Plotting regions without a coastline overlay.")
+
+    for ax, grid, cmap, label in panels:
+        vmax = np.nanmax(np.abs(grid))
+        im = ax.pcolormesh(lon, lat, grid, transform=ccrs.PlateCarree(),
+                           cmap=cmap, vmin=-vmax, vmax=vmax, shading="auto")
+        if have_natural_earth:
+            ax.coastlines(linewidth=0.5)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.5)
+        ax.add_geometries(
+            [region.polygon for region in AR6_REGIONS],
+            crs=ccrs.PlateCarree(), facecolor="none", edgecolor="black",
+            linewidth=0.4,
+        )
+        ax.set_global()
+        cb = fig.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.8)
+        cb.set_label(label, fontsize=11)
+
+    fig.suptitle(
+        f"Average climate change (multi-model spread, across-ESM) "
+        f"{year_start}–{year_end}  |  scenario: {ds_tas.attrs.get('scenario', '')}",
+        fontsize=12,
+    )
+    plt.tight_layout()
+
+    if save_dir is not None:
+        scenario_tag = (
+            os.path.basename(out_tas_nc)
+            .removeprefix("tas_")
+            .replace("_SCALES_regional_quantiles-across-ESM.nc", "")
+        )
+        fig_path = os.path.join(
+            save_dir, f"{scenario_tag}_{year_start}-{year_end}_avg_change_map_across_ESM.png")
         plt.savefig(fig_path, dpi=150)
         print(f"Plot saved -> {fig_path}", flush=True)
     plt.close(fig)

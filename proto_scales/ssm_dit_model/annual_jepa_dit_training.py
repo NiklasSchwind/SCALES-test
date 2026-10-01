@@ -65,6 +65,7 @@ def run_train(
     target_decay=0.996,
     jepa_weight=1.0,
     jepa_rollout_weight=1.0,
+    jepa_cov_weight=1.0,
     # DiT
     cond_dim=256,
     hidden=384,
@@ -171,6 +172,7 @@ def run_train(
         field_memory_rank=field_memory_rank,
         jepa_weight=jepa_weight,
         jepa_rollout_weight=jepa_rollout_weight,
+        jepa_cov_weight=jepa_cov_weight,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -185,7 +187,7 @@ def run_train(
         if raw_model.use_ssm_aux:
             print(f"[model] JEPA auxiliary objective ON (weight={jepa_weight}, "
                   f"rollout_weight={jepa_rollout_weight}, "
-                  f"target_decay={target_decay})")
+                  f"cov_weight={jepa_cov_weight}, target_decay={target_decay})")
         elif not freeze_jepa:
             print("[model] WARNING: JEPA latent process is trainable but has no "
                   "auxiliary objective. z is shaped by the flow-matching loss "
@@ -322,8 +324,8 @@ def run_train(
         if not tr_losses:
             raise RuntimeError(
                 f"epoch {epoch}: every step was skipped as non-finite. The model "
-                f"has diverged; lower --lr, --jepa_weight or "
-                f"--jepa_rollout_weight.")
+                f"has diverged; lower --lr, --jepa_weight, --jepa_rollout_weight "
+                f"or --jepa_cov_weight.")
         tr_mean = float(np.mean(tr_losses))
         va_mean = float(np.mean(va_losses)) if va_losses else float("nan")
         if is_main:
