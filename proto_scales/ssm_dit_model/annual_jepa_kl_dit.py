@@ -69,6 +69,27 @@ matching `ForcedAnnualSSM`'s own convention (see `annual_ssm_dit`'s docstring,
 "Why the conditioning z is the mean, not a sample") — this module adds a
 calibrated per-step variance to the *training signal*, it does not change what
 the DiT sees at sampling time.
+
+Three degenerate directions, three separate guards — same as `annual_jepa_dit`
+-------------------------------------------------------------------------------
+Every guard `ForcedAnnualJEPA` needed, this needs too, for the same reasons
+(see that module's docstring for the full derivation and the empirical
+symptoms each one was found from): `decay()` hard-clamps to `decay_efold_range`
+against magnitude collapse, `z_covariance_loss` penalises z-dimensions
+collapsing onto redundant copies of each other, and `z_norm` (a parameter-free
+`LayerNorm` on the encoder's mean) removes the joint-rescaling direction that
+the one-step KL is exactly as blind to as the plain MSE is — a KL between two
+Gaussians is just as invariant to a shared rescale of `mu_q`, `mu_p` and
+`logvar_q`/`logvar_p` by a common factor as an MSE is, so nothing about moving
+to a KL loss makes this particular direction go away on its own.
+
+What the KL *does* add beyond the deterministic model, on top of all three
+guards above: `log_process_var` is independently clamped to `[-12, 6]` in
+log-space, which caps how far the prior's implied variance can grow to chase
+a drifting `mu_q`/`mu_p` gap — a second, independent (if looser) ceiling on
+the same kind of runaway `z_norm` targets directly. The two are complementary,
+not redundant: `z_norm` pins the mean's scale exactly; the process-variance
+clamp bounds how much spread the model is allowed to claim around it.
 """
 
 import copy
@@ -149,12 +170,27 @@ class ForcedAnnualJEPAKL(nn.Module):
         for p in list(self.target_gru.parameters()) + list(self.target_q_head.parameters()):
             p.requires_grad_(False)
 
+        # Applied to the mean of both online and target encodings (see
+        # `_encode_dist`, `encode_target`) to pin z's scale structurally — no
+        # learnable parameters, so there is no way to smuggle the rescaling
+        # freedom back in. See the module docstring: a KL loss is exactly as
+        # blind to a joint rescale of mu_q/mu_p/logvar as a plain MSE is.
+        self.z_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
+
         # Per-dimension contraction, identical parameterisation to
         # `ForcedAnnualSSM.__init__` — see that module for why a dense `A` is
         # not used.
         tau = torch.logspace(math.log10(lo), math.log10(hi), z_dim)
         d0 = torch.exp(-1.0 / tau).clamp(1e-4, 1 - 1e-4)
         self.logit_decay = nn.Parameter(torch.log(d0 / (1.0 - d0)))
+
+        # `decay()` clamps to exactly this range forever after, not just at
+        # init — see `annual_jepa_dit.ForcedAnnualJEPA` for why nothing else
+        # stops `logit_decay` drifting to the sigmoid's saturation ceiling
+        # without this.
+        self.register_buffer("_decay_min", torch.tensor(math.exp(-1.0 / lo)))
+        self.register_buffer("_decay_max", torch.tensor(math.exp(-1.0 / hi)))
+
         self.B = nn.Linear(u_dim, z_dim, bias=False)
         self.trans_mlp = (
             nn.Sequential(nn.Linear(z_dim + u_dim, trans_hidden), nn.SiLU(),
@@ -171,7 +207,7 @@ class ForcedAnnualJEPAKL(nn.Module):
     # pieces
     # -----------------------
     def decay(self):
-        return torch.sigmoid(self.logit_decay)
+        return torch.sigmoid(self.logit_decay).clamp(self._decay_min, self._decay_max)
 
     def efolding_years(self):
         """Per-dimension e-folding times in years — the thing to inspect."""
@@ -186,10 +222,14 @@ class ForcedAnnualJEPAKL(nn.Module):
         return mu
 
     def _encode_dist(self, y, u):
-        """Online causal encoding over a window. Returns (mu, logvar), each [B, T, z]."""
+        """
+        Online causal encoding over a window. Returns (mu, logvar), each
+        [B, T, z]. `mu` is passed through `z_norm`; `logvar` is left alone —
+        it already has its own clamp.
+        """
         h, _ = self.gru(torch.cat([y, u], dim=-1))
         mu, logvar = torch.chunk(self.q_head(h), 2, dim=-1)
-        return mu, torch.clamp(logvar, -12.0, 6.0)
+        return self.z_norm(mu), torch.clamp(logvar, -12.0, 6.0)
 
     def encode(self, y, u):
         """Online encoding, mean only. Returns [B, T, z]."""
@@ -207,7 +247,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         """
         h, _ = self.target_gru(torch.cat([y, u], dim=-1))
         mu, _ = torch.chunk(self.target_q_head(h), 2, dim=-1)
-        return mu
+        return self.z_norm(mu)
 
     @torch.no_grad()
     def update_target_encoder(self):
@@ -296,6 +336,23 @@ class ForcedAnnualJEPAKL(nn.Module):
         )[:, y_ctx.shape[1]:]
         return ((z_traj - z_target_fut) ** 2).mean()
 
+    def z_covariance_loss(self, y, u):
+        """
+        VICReg-style covariance penalty on the online encoding's mean, pooled
+        over batch and time — identical in purpose and implementation to
+        `ForcedAnnualJEPA.z_covariance_loss`: guards against z-dimensions
+        becoming linearly redundant with each other, which `z_norm` and the
+        KL's free-bits floor do not by themselves prevent (a dimension can be
+        unit-scale and individually non-degenerate while still being a
+        near-copy of another one).
+        """
+        z = self.encode(y, u).reshape(-1, self.z_dim)
+        z = z - z.mean(dim=0, keepdim=True)
+        n = z.shape[0]
+        cov = (z.T @ z) / max(n - 1, 1)
+        off_diag = cov - torch.diag(torch.diagonal(cov))
+        return (off_diag ** 2).sum() / self.z_dim
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
@@ -316,10 +373,15 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
     is no separate NLL-vs-KL weighting the way the ELBO has — `jepa_weight`
     is the whole one-step term's weight, directly comparable to
     `AnnualJEPAOutpaintingDiT`'s `jepa_weight` for the plain-MSE version.
+
+    `jepa_cov_weight` adds `ForcedAnnualJEPAKL.z_covariance_loss`, same as
+    `AnnualJEPAOutpaintingDiT.jepa_cov_weight` — see that class's docstring
+    for why the ELBO doesn't need a counterpart for it.
     """
 
     def __init__(self, jepa, y_dim, u_dim, jepa_weight=1.0,
-                 jepa_rollout_weight=1.0, jepa_kl_free_bits=0.05, **kwargs):
+                 jepa_rollout_weight=1.0, jepa_kl_free_bits=0.05,
+                 jepa_cov_weight=1.0, **kwargs):
         super().__init__(
             ssm=jepa, y_dim=y_dim, u_dim=u_dim,
             ssm_elbo_weight=0.0, ssm_kl_weight=0.0, ssm_kl_free_bits=0.0,
@@ -328,8 +390,10 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
         self.jepa_weight = float(jepa_weight)
         self.jepa_rollout_weight = float(jepa_rollout_weight)
         self.jepa_kl_free_bits = float(jepa_kl_free_bits)
+        self.jepa_cov_weight = float(jepa_cov_weight)
         self.use_ssm_aux = (not self.ssm_encoder.frozen) and (
-            self.jepa_weight > 0 or self.jepa_rollout_weight > 0)
+            self.jepa_weight > 0 or self.jepa_rollout_weight > 0
+            or self.jepa_cov_weight > 0)
 
     def ssm_aux_loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut):
         """
@@ -343,13 +407,13 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
         y_ctx_ann, u_ctx_ann, u_fut_ann = enc.annual_inputs(
             tas_ctx, pr_ctx, u_ctx, u_fut)
         y_fut_ann = to_annual(torch.cat([tas_fut, pr_fut], dim=-1))
+        y_ann = torch.cat([y_ctx_ann, y_fut_ann], dim=1)
+        u_ann = torch.cat([u_ctx_ann, u_fut_ann], dim=1)
 
         parts = {}
         total = torch.zeros((), device=y_ctx_ann.device)
 
         if self.jepa_weight > 0:
-            y_ann = torch.cat([y_ctx_ann, y_fut_ann], dim=1)
-            u_ann = torch.cat([u_ctx_ann, u_fut_ann], dim=1)
             jepa_kl = enc.ssm.jepa_kl_loss(y_ann, u_ann, kl_free_bits=self.jepa_kl_free_bits)
             total = total + self.jepa_weight * jepa_kl
             parts["jepa_kl"] = jepa_kl.detach()
@@ -359,6 +423,11 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
                 y_ctx_ann, u_ctx_ann, y_fut_ann, u_fut_ann)
             total = total + self.jepa_rollout_weight * roll
             parts["jepa_rollout"] = roll.detach()
+
+        if self.jepa_cov_weight > 0:
+            cov = enc.ssm.z_covariance_loss(y_ann, u_ann)
+            total = total + self.jepa_cov_weight * cov
+            parts["jepa_cov"] = cov.detach()
 
         return total, parts
 

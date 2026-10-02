@@ -41,11 +41,13 @@ cannot do that, so the diffusion loss pulls against collapse from the other
 side. The target encoder removes the trivial optimum outright rather than
 relying on that alone.
 
-Two collapse modes, two separate guards
-------------------------------------------
+Three degenerate directions, three separate guards
+------------------------------------------------------
 The target encoder above prevents the *trivial* optimum (encoder collapses to
 a literal constant), but that turned out not to be the only degenerate
-solution available without an emission term:
+direction available without an emission term — each was found empirically, in
+this order, and each needed a different fix because each is invisible to the
+others:
 
 * **Magnitude collapse.** Nothing stops `logit_decay` drifting to the
   sigmoid's saturation ceiling (observed in practice: e-folding times in the
@@ -63,11 +65,26 @@ solution available without an emission term:
   nothing in `jepa_loss` rewards the dimensions for dividing up the work.
   `z_covariance_loss` penalises exactly this: off-diagonal covariance between
   z-dimensions, pooled over batch and time, VICReg-style.
+* **Scale runaway.** Rescaling the encoder's output by some factor `a`,
+  jointly with `B` (so the transition's prediction also scales by `a`),
+  leaves every loss above unchanged — a uniform rescale is a flat direction
+  none of them see, and under a long enough run with nothing anchoring it,
+  gradient noise can and did drift that direction, observed as every `B`-row
+  magnitude growing together (to roughly 3x their healthy values) while the
+  covariance loss stayed near zero throughout, since redundancy (shape) and
+  scale are different axes. `z_norm`, a parameter-free `LayerNorm` applied to
+  both `encode` and `encode_target`'s output, removes this direction
+  structurally rather than discouraging it: a uniform rescale of a
+  layer-normed vector has no effect, so there is nothing left for it to act
+  on. Deliberately not applied inside `transition_mean` or `roll_forward` —
+  renormalising every step of a multi-step rollout would fight the decay
+  dynamics itself; pinning the encoder's output is enough to give the
+  transition's own parameters somewhere stable to be compared against.
 
-Both were found empirically on this model, in that order — fixing magnitude
-collapse revealed the dimensional collapse underneath it, which a clamp on
-`decay` alone cannot touch, since it is about *agreement between dimensions*,
-not the magnitude of any one of them.
+None of these three is visible to the guards for the other two: the clamp is
+about one dimension's own magnitude, the covariance loss is about agreement
+*between* dimensions, and `z_norm` is about the *joint* scale of all of them
+together. Fixing one revealed the next sitting underneath it.
 
 What is unchanged from `annual_ssm_dit`
 -----------------------------------------
@@ -172,6 +189,17 @@ class ForcedAnnualJEPA(nn.Module):
         for p in list(self.target_gru.parameters()) + list(self.target_head.parameters()):
             p.requires_grad_(False)
 
+        # Applied to both online and target encodings (see `encode`,
+        # `encode_target`) to pin z's scale structurally: no learnable
+        # parameters, so there is no way to smuggle the rescaling freedom back
+        # in. Without this, a uniform rescale of the encoder's output (jointly
+        # with a matching rescale of `B`) leaves every loss below unchanged —
+        # observed in practice as every `B`-row magnitude drifting upward
+        # together over a long run. One shared instance is fine since there is
+        # nothing stateful to keep separate between the online and target
+        # paths.
+        self.z_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
+
         # Per-dimension contraction, identical parameterisation to
         # `ForcedAnnualSSM.__init__` — see that module for why a dense `A` is
         # not used.
@@ -216,15 +244,15 @@ class ForcedAnnualJEPA(nn.Module):
         return mu
 
     def encode(self, y, u):
-        """Online causal encoding over a window. Returns [B, T, z]."""
+        """Online causal encoding over a window. Returns [B, T, z], unit-scale per `z_norm`."""
         h, _ = self.gru(torch.cat([y, u], dim=-1))
-        return self.enc_head(h)
+        return self.z_norm(self.enc_head(h))
 
     @torch.no_grad()
     def encode_target(self, y, u):
         """Target-encoder read of the same window. Never carries a gradient."""
         h, _ = self.target_gru(torch.cat([y, u], dim=-1))
-        return self.target_head(h)
+        return self.z_norm(self.target_head(h))
 
     @torch.no_grad()
     def update_target_encoder(self):

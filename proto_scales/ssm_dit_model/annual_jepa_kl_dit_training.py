@@ -3,7 +3,8 @@ Training loop for `annual_jepa_kl_dit.AnnualJEPAKLOutpaintingDiT`.
 
 Identical to `annual_jepa_dit_training` — same windowed dataset, same
 model-wide sampling EMA, same per-step target-encoder EMA via
-`ForcedAnnualJEPAKL.update_target_encoder` — with the one-step auxiliary term
+`ForcedAnnualJEPAKL.update_target_encoder`, same `weight_decay=1e-4` default
+(see that module's docstring for why) — with the one-step auxiliary term
 being the KL loss described in `annual_jepa_kl_dit` instead of the plain MSE.
 """
 
@@ -42,7 +43,7 @@ def run_train(
     batch_size=8,
     epochs=200,
     lr=1e-4,
-    weight_decay=0.0,
+    weight_decay=1e-4,
     warmup_steps=500,
     # JEPA-KL latent process
     jepa_weights=None,
@@ -56,6 +57,7 @@ def run_train(
     jepa_weight=1.0,
     jepa_rollout_weight=1.0,
     jepa_kl_free_bits=0.05,
+    jepa_cov_weight=1.0,
     # DiT
     cond_dim=256,
     hidden=384,
@@ -163,6 +165,7 @@ def run_train(
         jepa_weight=jepa_weight,
         jepa_rollout_weight=jepa_rollout_weight,
         jepa_kl_free_bits=jepa_kl_free_bits,
+        jepa_cov_weight=jepa_cov_weight,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -177,7 +180,8 @@ def run_train(
         if raw_model.use_ssm_aux:
             print(f"[model] JEPA-KL auxiliary objective ON (weight={jepa_weight}, "
                   f"rollout_weight={jepa_rollout_weight}, "
-                  f"kl_free_bits={jepa_kl_free_bits}, target_decay={target_decay})")
+                  f"kl_free_bits={jepa_kl_free_bits}, cov_weight={jepa_cov_weight}, "
+                  f"target_decay={target_decay})")
         elif not freeze_jepa:
             print("[model] WARNING: JEPA-KL latent process is trainable but has no "
                   "auxiliary objective. z is shaped by the flow-matching loss "
@@ -314,8 +318,8 @@ def run_train(
         if not tr_losses:
             raise RuntimeError(
                 f"epoch {epoch}: every step was skipped as non-finite. The model "
-                f"has diverged; lower --lr, --jepa_weight, --jepa_rollout_weight "
-                f"or --jepa_kl_free_bits.")
+                f"has diverged; lower --lr, --jepa_weight, --jepa_rollout_weight, "
+                f"--jepa_kl_free_bits or --jepa_cov_weight.")
         tr_mean = float(np.mean(tr_losses))
         va_mean = float(np.mean(va_losses)) if va_losses else float("nan")
         if is_main:
