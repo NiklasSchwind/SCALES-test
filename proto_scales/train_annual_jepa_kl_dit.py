@@ -142,6 +142,8 @@ if __name__ == "__main__":
                    help="Multi-step rollout consistency in representation space (plain MSE, unchanged from the non-KL JEPA model). This is the only term that scores the many-step operator the sampler iterates; at 0, century rollouts are an unsupervised extrapolation from a next-year fit")
     p.add_argument("--jepa_kl_free_bits", type=float, default=0.05,
                    help="Per-dimension KL floor for the one-step term, same role as --ssm_kl_free_bits in the ELBO model: insurance against the posterior trivially matching the prior on dimensions that have nothing to say")
+    p.add_argument("--jepa_cov_weight", type=float, default=1.0,
+                   help="VICReg-style covariance penalty on the online encoding: guards against z-dimensions collapsing onto redundant copies of each other (different from magnitude collapse, which decay_efold_range's clamp and --weight_decay guard against)")
 
     # DiT
     p.add_argument("--context_len", type=int, default=120,
@@ -168,7 +170,8 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--weight_decay", type=float, default=1e-4,
+                   help="Nonzero by default here (same reasoning as the deterministic JEPA script): with no emission term grounding the transition, nothing else discourages logit_decay/B drifting to a degenerate saturated point, and AdamW applies this to every parameter including those")
     p.add_argument("--warmup_steps", type=int, default=500)
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--stride", type=int, default=7,
@@ -213,6 +216,7 @@ if __name__ == "__main__":
             jepa_weight=args.jepa_weight,
             jepa_rollout_weight=args.jepa_rollout_weight,
             jepa_kl_free_bits=args.jepa_kl_free_bits,
+            jepa_cov_weight=args.jepa_cov_weight,
             cond_dim=args.cond_dim, hidden=args.hidden, depth=args.depth,
             heads=args.heads, n_flow_steps=args.n_flow_steps,
             timescales_years=tuple(args.timescales),
