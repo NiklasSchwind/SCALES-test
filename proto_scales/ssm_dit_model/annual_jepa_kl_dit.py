@@ -76,20 +76,25 @@ Every guard `ForcedAnnualJEPA` needed, this needs too, for the same reasons
 (see that module's docstring for the full derivation and the empirical
 symptoms each one was found from): `decay()` hard-clamps to `decay_efold_range`
 against magnitude collapse, `z_covariance_loss` penalises z-dimensions
-collapsing onto redundant copies of each other, and `z_norm` (a parameter-free
-`LayerNorm` on the encoder's mean) removes the joint-rescaling direction that
-the one-step KL is exactly as blind to as the plain MSE is — a KL between two
-Gaussians is just as invariant to a shared rescale of `mu_q`, `mu_p` and
-`logvar_q`/`logvar_p` by a common factor as an MSE is, so nothing about moving
-to a KL loss makes this particular direction go away on its own.
+collapsing onto redundant copies of each other, and `_standardize` (applied to
+`mu`, pooled per dimension over batch and time) removes the per-dimension
+rescaling direction that the one-step KL is exactly as blind to as the plain
+MSE is — a KL between two Gaussians is just as invariant to a per-dimension
+rescale of `mu_q`, `mu_p` and `logvar_q`/`logvar_p` as an MSE is, so nothing
+about moving to a KL loss makes this particular direction go away on its own.
+(An earlier version of this guard used `nn.LayerNorm(z_dim)` — normalizing
+*across* dimensions instead of *per* dimension — and that was wrong for the
+same reason it was wrong in `annual_jepa_dit`: seeing it fail there is what
+caught it here before it was ever trained on.)
 
 What the KL *does* add beyond the deterministic model, on top of all three
 guards above: `log_process_var` is independently clamped to `[-12, 6]` in
 log-space, which caps how far the prior's implied variance can grow to chase
 a drifting `mu_q`/`mu_p` gap — a second, independent (if looser) ceiling on
-the same kind of runaway `z_norm` targets directly. The two are complementary,
-not redundant: `z_norm` pins the mean's scale exactly; the process-variance
-clamp bounds how much spread the model is allowed to claim around it.
+the same kind of runaway `_standardize` targets directly. The two are
+complementary, not redundant: `_standardize` pins each dimension's own scale
+exactly; the process-variance clamp bounds how much spread the model is
+allowed to claim around it.
 """
 
 import copy
@@ -170,13 +175,6 @@ class ForcedAnnualJEPAKL(nn.Module):
         for p in list(self.target_gru.parameters()) + list(self.target_q_head.parameters()):
             p.requires_grad_(False)
 
-        # Applied to the mean of both online and target encodings (see
-        # `_encode_dist`, `encode_target`) to pin z's scale structurally — no
-        # learnable parameters, so there is no way to smuggle the rescaling
-        # freedom back in. See the module docstring: a KL loss is exactly as
-        # blind to a joint rescale of mu_q/mu_p/logvar as a plain MSE is.
-        self.z_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
-
         # Per-dimension contraction, identical parameterisation to
         # `ForcedAnnualSSM.__init__` — see that module for why a dense `A` is
         # not used.
@@ -221,15 +219,32 @@ class ForcedAnnualJEPAKL(nn.Module):
             mu = mu + self.trans_mlp(torch.cat([z_prev, u_t], dim=-1))
         return mu
 
+    def _standardize(self, z):
+        """
+        Per-dimension standardization, pooled over batch and time. Unlike
+        `nn.LayerNorm(z_dim)` (which normalizes *across* dimensions at every
+        timestep, forcing all z-dimensions to comparable scale at each
+        instant — fights having a few dominant slow modes and several minor
+        fast ones), this leaves each dimension's own relative importance
+        alone and only removes *that dimension's own* scale drifting freely
+        over training: a factor-`k` rescale of one dimension's whole
+        trajectory is exactly cancelled by that dimension's own pooled std
+        also scaling by `k`. See `annual_jepa_dit.ForcedAnnualJEPA` for why
+        the LayerNorm version of this fix was tried first and found wrong.
+        """
+        mean = z.mean(dim=(0, 1), keepdim=True)
+        std = z.std(dim=(0, 1), keepdim=True).clamp(min=1e-4)
+        return (z - mean) / std
+
     def _encode_dist(self, y, u):
         """
         Online causal encoding over a window. Returns (mu, logvar), each
-        [B, T, z]. `mu` is passed through `z_norm`; `logvar` is left alone —
-        it already has its own clamp.
+        [B, T, z]. `mu` is standardized per dimension; `logvar` is left
+        alone — it already has its own clamp.
         """
         h, _ = self.gru(torch.cat([y, u], dim=-1))
         mu, logvar = torch.chunk(self.q_head(h), 2, dim=-1)
-        return self.z_norm(mu), torch.clamp(logvar, -12.0, 6.0)
+        return self._standardize(mu), torch.clamp(logvar, -12.0, 6.0)
 
     def encode(self, y, u):
         """Online encoding, mean only. Returns [B, T, z]."""
@@ -247,7 +262,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         """
         h, _ = self.target_gru(torch.cat([y, u], dim=-1))
         mu, _ = torch.chunk(self.target_q_head(h), 2, dim=-1)
-        return self.z_norm(mu)
+        return self._standardize(mu)
 
     @torch.no_grad()
     def update_target_encoder(self):
@@ -341,9 +356,9 @@ class ForcedAnnualJEPAKL(nn.Module):
         VICReg-style covariance penalty on the online encoding's mean, pooled
         over batch and time — identical in purpose and implementation to
         `ForcedAnnualJEPA.z_covariance_loss`: guards against z-dimensions
-        becoming linearly redundant with each other, which `z_norm` and the
-        KL's free-bits floor do not by themselves prevent (a dimension can be
-        unit-scale and individually non-degenerate while still being a
+        becoming linearly redundant with each other, which `_standardize` and
+        the KL's free-bits floor do not by themselves prevent (a dimension can
+        be unit-scale and individually non-degenerate while still being a
         near-copy of another one).
         """
         z = self.encode(y, u).reshape(-1, self.z_dim)

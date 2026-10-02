@@ -65,26 +65,35 @@ others:
   nothing in `jepa_loss` rewards the dimensions for dividing up the work.
   `z_covariance_loss` penalises exactly this: off-diagonal covariance between
   z-dimensions, pooled over batch and time, VICReg-style.
-* **Scale runaway.** Rescaling the encoder's output by some factor `a`,
-  jointly with `B` (so the transition's prediction also scales by `a`),
-  leaves every loss above unchanged — a uniform rescale is a flat direction
-  none of them see, and under a long enough run with nothing anchoring it,
-  gradient noise can and did drift that direction, observed as every `B`-row
-  magnitude growing together (to roughly 3x their healthy values) while the
-  covariance loss stayed near zero throughout, since redundancy (shape) and
-  scale are different axes. `z_norm`, a parameter-free `LayerNorm` applied to
-  both `encode` and `encode_target`'s output, removes this direction
-  structurally rather than discouraging it: a uniform rescale of a
-  layer-normed vector has no effect, so there is nothing left for it to act
-  on. Deliberately not applied inside `transition_mean` or `roll_forward` —
-  renormalising every step of a multi-step rollout would fight the decay
-  dynamics itself; pinning the encoder's output is enough to give the
-  transition's own parameters somewhere stable to be compared against.
+* **Scale runaway.** Rescaling one z-dimension's encoder output by some
+  factor `k`, jointly with that dimension's row of `B` (so the transition's
+  prediction for it also scales by `k`), leaves every loss above unchanged —
+  a per-dimension rescale is a flat direction none of them see, and under a
+  long enough run with nothing anchoring it, gradient noise can and did drift
+  that direction, observed as every `B`-row magnitude growing together (to
+  roughly 3x their healthy values) while the covariance loss stayed near zero
+  throughout, since redundancy (shape) and scale are different axes.
+  `_standardize` (used inside both `encode` and `encode_target`) removes this
+  direction structurally rather than discouraging it: it subtracts each
+  dimension's own mean and divides by that dimension's own std, pooled over
+  batch and time, so a `k`-rescale of one dimension is exactly cancelled —
+  there is nothing left for it to act on. This is deliberately a *per
+  z-dimension* standardization, not `nn.LayerNorm(z_dim)` normalizing across
+  dimensions at each timestep — the first version of this fix used LayerNorm
+  and it was wrong: forcing every dimension to comparable scale at every
+  instant fights having a few dominant slow modes and several minor fast
+  ones, and in practice pushed `B` back toward collapse rather than fixing
+  anything. Also deliberately not applied inside `transition_mean` or
+  `roll_forward` — renormalising every step of a multi-step rollout would
+  fight the decay dynamics itself; standardizing the encoder's output is
+  enough to give the transition's own parameters somewhere stable to be
+  compared against.
 
 None of these three is visible to the guards for the other two: the clamp is
-about one dimension's own magnitude, the covariance loss is about agreement
-*between* dimensions, and `z_norm` is about the *joint* scale of all of them
-together. Fixing one revealed the next sitting underneath it.
+about one dimension's own magnitude relative to the fixed [1, 50] year range,
+the covariance loss is about agreement *between* dimensions, and
+`_standardize` is about each dimension's own scale staying fixed over the
+course of training. Fixing one revealed the next sitting underneath it.
 
 What is unchanged from `annual_ssm_dit`
 -----------------------------------------
@@ -189,17 +198,6 @@ class ForcedAnnualJEPA(nn.Module):
         for p in list(self.target_gru.parameters()) + list(self.target_head.parameters()):
             p.requires_grad_(False)
 
-        # Applied to both online and target encodings (see `encode`,
-        # `encode_target`) to pin z's scale structurally: no learnable
-        # parameters, so there is no way to smuggle the rescaling freedom back
-        # in. Without this, a uniform rescale of the encoder's output (jointly
-        # with a matching rescale of `B`) leaves every loss below unchanged —
-        # observed in practice as every `B`-row magnitude drifting upward
-        # together over a long run. One shared instance is fine since there is
-        # nothing stateful to keep separate between the online and target
-        # paths.
-        self.z_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
-
         # Per-dimension contraction, identical parameterisation to
         # `ForcedAnnualSSM.__init__` — see that module for why a dense `A` is
         # not used.
@@ -243,16 +241,32 @@ class ForcedAnnualJEPA(nn.Module):
             mu = mu + self.trans_mlp(torch.cat([z_prev, u_t], dim=-1))
         return mu
 
+    def _standardize(self, z):
+        """
+        Per-dimension standardization, pooled over batch and time. Unlike
+        `nn.LayerNorm(z_dim)` (which normalizes *across* dimensions at every
+        timestep, forcing all z-dimensions to comparable scale at each
+        instant — fights having a few dominant slow modes and several minor
+        fast ones), this leaves each dimension's own relative importance
+        alone and only removes *that dimension's own* scale drifting freely
+        over training: a factor-`k` rescale of one dimension's whole
+        trajectory is exactly cancelled by that dimension's own pooled std
+        also scaling by `k`.
+        """
+        mean = z.mean(dim=(0, 1), keepdim=True)
+        std = z.std(dim=(0, 1), keepdim=True).clamp(min=1e-4)
+        return (z - mean) / std
+
     def encode(self, y, u):
-        """Online causal encoding over a window. Returns [B, T, z], unit-scale per `z_norm`."""
+        """Online causal encoding over a window. Returns [B, T, z], standardized per dimension."""
         h, _ = self.gru(torch.cat([y, u], dim=-1))
-        return self.z_norm(self.enc_head(h))
+        return self._standardize(self.enc_head(h))
 
     @torch.no_grad()
     def encode_target(self, y, u):
         """Target-encoder read of the same window. Never carries a gradient."""
         h, _ = self.target_gru(torch.cat([y, u], dim=-1))
-        return self.z_norm(self.target_head(h))
+        return self._standardize(self.target_head(h))
 
     @torch.no_grad()
     def update_target_encoder(self):
