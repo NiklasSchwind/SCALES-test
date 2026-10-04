@@ -136,6 +136,8 @@ if __name__ == "__main__":
                    help="Range of latent e-folding times in YEARS spanned at init")
     p.add_argument("--target_decay", type=float, default=0.996,
                    help="EMA decay for the JEPA target encoder. Kept lower than --ema_decay: an encoder that changes too slowly leaves the predictor chasing a stale target early in training")
+    p.add_argument("--no_normalize_z", action="store_false", dest="normalize_z",
+                   help="Disable the per-dimension standardization of _encode_dist()/encode_target()'s mean output. On by default; this flag exists for ablating how much of the observed improvement is actually coming from standardization versus from using a KL loss at all — not something to turn off otherwise")
     p.add_argument("--jepa_weight", type=float, default=1.0,
                    help="One-step-ahead JEPA-KL loss. Normalised per (year x z-dim), so on the same scale as the diffusion loss")
     p.add_argument("--jepa_rollout_weight", type=float, default=1.0,
@@ -213,6 +215,7 @@ if __name__ == "__main__":
             trans_hidden=args.trans_hidden,
             decay_efold_range=tuple(args.decay_efold),
             target_decay=args.target_decay,
+            normalize_z=args.normalize_z,
             jepa_weight=args.jepa_weight,
             jepa_rollout_weight=args.jepa_rollout_weight,
             jepa_kl_free_bits=args.jepa_kl_free_bits,

@@ -54,6 +54,7 @@ def run_train(
     trans_hidden=0,
     decay_efold_range=(1.0, 50.0),
     target_decay=0.996,
+    normalize_z=True,
     jepa_weight=1.0,
     jepa_rollout_weight=1.0,
     jepa_kl_free_bits=0.05,
@@ -143,7 +144,7 @@ def run_train(
     jepa = ForcedAnnualJEPAKL(
         obs_dim=2 * Dy, u_dim=Du, z_dim=z_dim, rnn_hidden=rnn_hidden,
         trans_hidden=trans_hidden, decay_efold_range=decay_efold_range,
-        target_decay=target_decay,
+        target_decay=target_decay, normalize_z=normalize_z,
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")
@@ -177,6 +178,8 @@ def run_train(
               f"(effective batch {batch_size * blocks_per_step})")
         print(f"[model] z e-folding times (yr): "
               f"{[round(v, 1) for v in jepa.efolding_years().tolist()]}")
+        print(f"[model] per-dimension z standardization: "
+              f"{'ON' if normalize_z else 'OFF (ablation)'}")
         if raw_model.use_ssm_aux:
             print(f"[model] JEPA-KL auxiliary objective ON (weight={jepa_weight}, "
                   f"rollout_weight={jepa_rollout_weight}, "

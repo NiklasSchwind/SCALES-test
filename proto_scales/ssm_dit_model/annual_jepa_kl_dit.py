@@ -143,6 +143,13 @@ class ForcedAnnualJEPAKL(nn.Module):
                         leaves the predictor chasing a stale target early in
                         training, when the online encoder itself is moving
                         fastest.
+    normalize_z       : whether `_encode_dist`/`encode_target` apply
+                        `_standardize` to `mu`. Default True (the fix
+                        described above). False recovers the pre-fix
+                        behaviour, for ablating how much of the observed
+                        improvement is actually coming from this versus from
+                        using a KL loss at all — not something to turn off
+                        otherwise.
     """
 
     def __init__(
@@ -154,6 +161,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         trans_hidden=0,
         decay_efold_range=(1.0, 50.0),
         target_decay=0.996,
+        normalize_z=True,
     ):
         super().__init__()
         lo, hi = decay_efold_range
@@ -164,6 +172,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         self.u_dim = u_dim
         self.z_dim = z_dim
         self.target_decay = float(target_decay)
+        self.normalize_z = bool(normalize_z)
 
         # Online encoder: causal read of the field, now a Gaussian.
         self.gru = nn.GRU(obs_dim + u_dim, rnn_hidden, batch_first=True)
@@ -231,7 +240,12 @@ class ForcedAnnualJEPAKL(nn.Module):
         trajectory is exactly cancelled by that dimension's own pooled std
         also scaling by `k`. See `annual_jepa_dit.ForcedAnnualJEPA` for why
         the LayerNorm version of this fix was tried first and found wrong.
+
+        A no-op when `normalize_z=False` — gated here, in one place, rather
+        than at each call site.
         """
+        if not self.normalize_z:
+            return z
         mean = z.mean(dim=(0, 1), keepdim=True)
         std = z.std(dim=(0, 1), keepdim=True).clamp(min=1e-4)
         return (z - mean) / std
@@ -461,6 +475,7 @@ def build_model(y_dim, u_dim, device="cpu", jepa_weights=None, **kwargs):
         trans_hidden=kwargs.pop("trans_hidden", 0),
         decay_efold_range=kwargs.pop("decay_efold_range", (1.0, 50.0)),
         target_decay=kwargs.pop("target_decay", 0.996),
+        normalize_z=kwargs.pop("normalize_z", True),
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")
