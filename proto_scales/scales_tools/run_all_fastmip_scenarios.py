@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import cftime
 import matplotlib
@@ -6,6 +7,7 @@ matplotlib.use("Agg")   # no display needed on cluster
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import regionmask
 import torch
 import xarray as xr
 
@@ -200,6 +202,87 @@ def compute_yearly_stats(out_nc):
     ds_stats.to_netcdf(out_stats_nc)
     print(f"Saved -> {out_stats_nc}", flush=True)
     return out_stats_nc
+
+
+def select_gmt_cols_from_subselection(gmt_cols, key,
+                                      csv_path="downloads/subselection_forced_v20260325.csv"):
+    """Return the entries of gmt_cols whose indices are listed under `key` in the
+    subselection CSV (column A is a row index and is ignored; columns B-H are the keys)."""
+    df = pd.read_csv(csv_path, index_col=0)
+    subselection = {col: df[col].dropna().astype(int).tolist() for col in df.columns}
+    if key not in subselection:
+        raise KeyError(f"'{key}' not in subselection keys: {list(subselection)}")
+    gmt_cols = np.asarray(gmt_cols)
+    return gmt_cols[subselection[key]].tolist()
+
+
+def filter_monthly_projections_and_save(out_nc, start_year, end_year, proj_names):
+    """Resave the monthly projections restricted to [start_year, end_year] (inclusive)
+    and to the realisations listed in proj_names."""
+    ds_full = xr.open_dataset(out_nc, use_cftime=True)
+
+    years = ds_full.time.dt.year
+    ds_sel = ds_full.sel(
+        time=(years >= start_year) & (years <= end_year),
+        realisation=list(proj_names),
+    ).load()
+    ds_sel.attrs = ds_full.attrs
+    ds_full.close()
+
+    out_filtered_nc = out_nc.replace(".nc", f"_{start_year}_{end_year}_filtered.nc")
+    ds_sel.to_netcdf(out_filtered_nc)
+    print(f"Saved -> {out_filtered_nc}", flush=True)
+    return out_filtered_nc
+
+
+def baseline_correct_and_save(out_filtered_nc, baseline_dir, variables=("tas", "pr")):
+    """Shift each variable/region of the filtered monthly projections by the historical
+    'mean' found in <baseline_dir>/<esm lower case>_<var>_historical.json."""
+    ds = xr.open_dataset(out_filtered_nc, use_cftime=True).load()
+
+    for var in variables:
+        offsets = []
+        for esm_name in ds.esm.values:
+            json_path = os.path.join(baseline_dir, f"{str(esm_name).lower()}_{var}_historical.json")
+            with open(json_path) as f:
+                baseline = json.load(f)
+            offsets.append([baseline[str(r)]["mean"] for r in ds.region.values])
+        offset = xr.DataArray(offsets, dims=["esm", "region"],
+                              coords={"esm": ds.esm, "region": ds.region})
+        attrs = ds[var].attrs
+        ds[var] = ds[var] + offset
+        ds[var].attrs = attrs
+
+    ds.attrs["baseline_correction"] = f"historical mean added from {baseline_dir}"
+    out_bc_nc = out_filtered_nc.replace(".nc", "_baseline_corrected.nc")
+    ds.to_netcdf(out_bc_nc)
+    print(f"Saved -> {out_bc_nc}", flush=True)
+    return out_bc_nc
+
+
+def baseline_corrected_to_numpy(out_bc_nc, esm=None, variables=("tas", "pr")):
+    """Return the monthly data of one ESM as an array of shape
+    (N months, n realisations, C channels, R regions), with regions ordered like
+    regionmask.defined_regions.ar6.all.
+
+    esm may be omitted only if the file holds exactly one ESM."""
+    regions_xr = regionmask.defined_regions.ar6.all
+
+    ds = xr.open_dataset(out_bc_nc, use_cftime=True)
+    if esm is not None:
+        ds = ds.sel(esm=esm)
+    elif ds.sizes["esm"] == 1:
+        ds = ds.isel(esm=0)
+    else:
+        raise ValueError(f"File has {ds.sizes['esm']} 'esm' entries; pass esm=... to select one")
+
+    # dataset regions are the AR6 abbreviations; ar6.all.abbrevs has the same order as .names
+    ds = ds.sel(region=list(regions_xr.abbrevs))
+    arr = np.stack(
+        [ds[var].transpose("time", "realisation", "region").values for var in variables], axis=2
+    )
+    ds.close()
+    return arr
 
 
 def plot_yearly_stats(out_stats_nc, region_sel="EAS", save_dir=None):
