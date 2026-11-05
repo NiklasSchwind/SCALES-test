@@ -150,6 +150,34 @@ class ForcedAnnualJEPAKL(nn.Module):
                         improvement is actually coming from this versus from
                         using a KL loss at all — not something to turn off
                         otherwise.
+    gated_decay       : make each dimension's timescale depend on the state,
+                        tau_t = tau(z_t-1, u_t), so the slow modes can take
+                        up and release heat at different rates (warming vs.
+                        cooling asymmetry). Bounded by construction in
+                        log-timescale space:
+
+                            log tau = log lo + (log hi - log lo)
+                                      * sigmoid(logit_tau + gate(z_prev, u_t))
+
+                        so tau never leaves `decay_efold_range` and long
+                        rollouts stay contractive — unlike `trans_hidden`'s
+                        additive correction, which can undo the clamp. The
+                        bound is smooth, so dimensions near a limit still get
+                        gradient (the hard clamp in the linear mode gives none
+                        once a dimension is pinned). The gate's last layer is
+                        zero-initialised: at step 0 the model is a linear SSM
+                        with log-spaced timescales.
+
+                        The gate reads `z_prev` rather than a forcing
+                        increment: the slow z-dimensions already integrate
+                        the forcing history, so `z_prev` vs. `u_t` carries
+                        the warming/cooling signal without a noisy annual
+                        delta-GMT, and without `roll_forward` needing the
+                        last context forcing. Cost: the transition is no
+                        longer linear in z, so the deterministic rollout is
+                        an approximation of the conditional mean, exactly as
+                        with `trans_hidden`.
+    gate_hidden       : hidden width of the decay gate MLP.
     """
 
     def __init__(
@@ -162,6 +190,8 @@ class ForcedAnnualJEPAKL(nn.Module):
         decay_efold_range=(1.0, 50.0),
         target_decay=0.996,
         normalize_z=True,
+        gated_decay=False,
+        gate_hidden=32,
     ):
         super().__init__()
         lo, hi = decay_efold_range
@@ -173,6 +203,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         self.z_dim = z_dim
         self.target_decay = float(target_decay)
         self.normalize_z = bool(normalize_z)
+        self.gated_decay = bool(gated_decay)
 
         # Online encoder: causal read of the field, now a Gaussian.
         self.gru = nn.GRU(obs_dim + u_dim, rnn_hidden, batch_first=True)
@@ -184,19 +215,35 @@ class ForcedAnnualJEPAKL(nn.Module):
         for p in list(self.target_gru.parameters()) + list(self.target_q_head.parameters()):
             p.requires_grad_(False)
 
-        # Per-dimension contraction, identical parameterisation to
-        # `ForcedAnnualSSM.__init__` — see that module for why a dense `A` is
-        # not used.
-        tau = torch.logspace(math.log10(lo), math.log10(hi), z_dim)
-        d0 = torch.exp(-1.0 / tau).clamp(1e-4, 1 - 1e-4)
-        self.logit_decay = nn.Parameter(torch.log(d0 / (1.0 - d0)))
+        if self.gated_decay:
+            # Position of each dimension's timescale in [log lo, log hi],
+            # through a sigmoid. Spread log-uniformly but kept off the very
+            # ends, where the sigmoid is saturated. Separate parameter name
+            # from `logit_decay` so a linear-mode checkpoint can't be loaded
+            # into it and silently reinterpreted.
+            self.register_buffer("_log_tau_lo", torch.tensor(math.log(lo)))
+            self.register_buffer("_log_tau_hi", torch.tensor(math.log(hi)))
+            frac = torch.linspace(0.05, 0.95, z_dim)
+            self.logit_tau = nn.Parameter(torch.log(frac / (1.0 - frac)))
+            self.decay_gate = nn.Sequential(
+                nn.Linear(z_dim + u_dim, gate_hidden), nn.SiLU(),
+                nn.Linear(gate_hidden, z_dim))
+            nn.init.zeros_(self.decay_gate[-1].weight)
+            nn.init.zeros_(self.decay_gate[-1].bias)
+        else:
+            # Per-dimension contraction, identical parameterisation to
+            # `ForcedAnnualSSM.__init__` — see that module for why a dense
+            # `A` is not used.
+            tau = torch.logspace(math.log10(lo), math.log10(hi), z_dim)
+            d0 = torch.exp(-1.0 / tau).clamp(1e-4, 1 - 1e-4)
+            self.logit_decay = nn.Parameter(torch.log(d0 / (1.0 - d0)))
 
-        # `decay()` clamps to exactly this range forever after, not just at
-        # init — see `annual_jepa_dit.ForcedAnnualJEPA` for why nothing else
-        # stops `logit_decay` drifting to the sigmoid's saturation ceiling
-        # without this.
-        self.register_buffer("_decay_min", torch.tensor(math.exp(-1.0 / lo)))
-        self.register_buffer("_decay_max", torch.tensor(math.exp(-1.0 / hi)))
+            # `decay()` clamps to exactly this range forever after, not just
+            # at init — see `annual_jepa_dit.ForcedAnnualJEPA` for why nothing
+            # else stops `logit_decay` drifting to the sigmoid's saturation
+            # ceiling without this.
+            self.register_buffer("_decay_min", torch.tensor(math.exp(-1.0 / lo)))
+            self.register_buffer("_decay_max", torch.tensor(math.exp(-1.0 / hi)))
 
         self.B = nn.Linear(u_dim, z_dim, bias=False)
         self.trans_mlp = (
@@ -213,17 +260,52 @@ class ForcedAnnualJEPAKL(nn.Module):
     # -----------------------
     # pieces
     # -----------------------
-    def decay(self):
+    def _log_tau(self, z_prev=None, u_t=None):
+        """Gated mode only. Without inputs, the gate is off (baseline tau)."""
+        a = self.logit_tau
+        if z_prev is not None:
+            a = a + self.decay_gate(torch.cat([z_prev, u_t], dim=-1))
+        return self._log_tau_lo + (self._log_tau_hi - self._log_tau_lo) * torch.sigmoid(a)
+
+    def decay(self, z_prev=None, u_t=None):
+        """
+        Per-dimension contraction. In gated mode, pass `z_prev`/`u_t` for the
+        state-dependent decay; without them this returns the baseline (gate
+        off), which is what `efolding_years` reports.
+        """
+        if self.gated_decay:
+            return torch.exp(-torch.exp(-self._log_tau(z_prev, u_t)))
         return torch.sigmoid(self.logit_decay).clamp(self._decay_min, self._decay_max)
 
     def efolding_years(self):
-        """Per-dimension e-folding times in years — the thing to inspect."""
+        """
+        Per-dimension e-folding times in years — the thing to inspect. In
+        gated mode this is the baseline, before the gate; see
+        `gated_efolding_years` for what the rollout actually uses.
+        """
         with torch.no_grad():
             d = self.decay().clamp(1e-6, 1 - 1e-9)
             return (-1.0 / torch.log(d)).cpu()
 
+    @torch.no_grad()
+    def gated_efolding_years(self, z0, u_fut):
+        """
+        Gated mode only: e-folding times along a mean rollout from `z0`
+        under `u_fut` ([B, Y, u]). Returns [B, Y, z] in years — compare
+        warming vs. cooling phases to see whether the gate is being used.
+        """
+        if not self.gated_decay:
+            raise ValueError("gated_efolding_years needs gated_decay=True")
+        z = z0
+        taus = []
+        for k in range(u_fut.shape[1]):
+            taus.append(torch.exp(self._log_tau(z, u_fut[:, k])))
+            z = self.transition_mean(z, u_fut[:, k])
+        return torch.stack(taus, dim=1).cpu()
+
     def transition_mean(self, z_prev, u_t):
-        mu = self.decay() * z_prev + self.B(u_t)
+        d = self.decay(z_prev, u_t) if self.gated_decay else self.decay()
+        mu = d * z_prev + self.B(u_t)
         if self.trans_mlp is not None:
             mu = mu + self.trans_mlp(torch.cat([z_prev, u_t], dim=-1))
         return mu
@@ -476,6 +558,8 @@ def build_model(y_dim, u_dim, device="cpu", jepa_weights=None, **kwargs):
         decay_efold_range=kwargs.pop("decay_efold_range", (1.0, 50.0)),
         target_decay=kwargs.pop("target_decay", 0.996),
         normalize_z=kwargs.pop("normalize_z", True),
+        gated_decay=kwargs.pop("gated_decay", False),
+        gate_hidden=kwargs.pop("gate_hidden", 32),
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")

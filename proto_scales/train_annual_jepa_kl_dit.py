@@ -134,6 +134,10 @@ if __name__ == "__main__":
     p.add_argument("--decay_efold", nargs=2, type=float, default=[1.0, 50.0],
                    metavar=("LOW", "HIGH"),
                    help="Range of latent e-folding times in YEARS spanned at init")
+    p.add_argument("--gated_decay", action="store_true",
+                   help="State-dependent timescales: tau_t = tau(z_t-1, u_t), smoothly bounded to --decay_efold in log-timescale space, so slow modes can respond differently to warming and cooling while staying contractive. Gate is zero-initialised, so training starts from the linear model. Not compatible with warm-starting from a linear-mode checkpoint")
+    p.add_argument("--gate_hidden", type=int, default=32,
+                   help="Hidden width of the --gated_decay gate MLP")
     p.add_argument("--target_decay", type=float, default=0.996,
                    help="EMA decay for the JEPA target encoder. Kept lower than --ema_decay: an encoder that changes too slowly leaves the predictor chasing a stale target early in training")
     p.add_argument("--no_normalize_z", action="store_false", dest="normalize_z",
@@ -216,6 +220,7 @@ if __name__ == "__main__":
             decay_efold_range=tuple(args.decay_efold),
             target_decay=args.target_decay,
             normalize_z=args.normalize_z,
+            gated_decay=args.gated_decay, gate_hidden=args.gate_hidden,
             jepa_weight=args.jepa_weight,
             jepa_rollout_weight=args.jepa_rollout_weight,
             jepa_kl_free_bits=args.jepa_kl_free_bits,
