@@ -185,6 +185,8 @@ if __name__ == "__main__":
     p.add_argument("--data_start_month", type=int, default=0,
                    help="Calendar month (0-11) of time index 0; use the same value at inference")
     p.add_argument("--weights_file", type=str, default=None, help="Warm-start full-model weights")
+    p.add_argument("--weights_key", type=str, default="model", choices=["model", "ema"],
+                   help="Which weights to take from an epoch checkpoint {model, ema}; ignored for a bare state dict such as model_out")
     p.add_argument("--ckpt_every", type=int, default=10)
 
     args = p.parse_args()
@@ -233,6 +235,7 @@ if __name__ == "__main__":
             ema_decay=args.ema_decay, stride=args.stride,
             data_start_month=args.data_start_month,
             run_dir=run_dir, weights_file=args.weights_file,
+            weights_key=args.weights_key,
             ckpt_every=args.ckpt_every,
         )
     except Exception:

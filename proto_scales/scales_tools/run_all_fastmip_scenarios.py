@@ -336,6 +336,503 @@ def plot_yearly_stats(out_stats_nc, region_sel="EAS", save_dir=None):
     ds_s.close()
 
 
+# ── Multi-scenario peak-warming analysis ─────────────────────────────────────
+
+SCENARIO_COLORS = {
+    "VL": "#1a1aa6", "LN": "#33d6e0", "L": "#1f9e5a", "ML": "#e6c229",
+    "M": "#f07f13", "HL": "#f03cf0", "H": "#b01c1c",
+}
+
+
+_AR6_AREA_WEIGHTS = None
+
+
+def _ar6_area_weights(res=0.5):
+    """Relative surface area of every AR6 region ({abbrev: weight}), from a
+    cos(lat)-weighted regular grid. Cached after the first call."""
+    global _AR6_AREA_WEIGHTS
+    if _AR6_AREA_WEIGHTS is None:
+        ar6 = regionmask.defined_regions.ar6.all
+        lon = np.arange(-180 + res / 2, 180, res)
+        lat = np.arange(-90 + res / 2, 90, res)
+        mask = ar6.mask(lon, lat).values
+        cell = np.broadcast_to(np.cos(np.deg2rad(lat))[:, None], mask.shape)
+        _AR6_AREA_WEIGHTS = {
+            r.abbrev: float(cell[mask == r.number].sum()) for r in ar6
+        }
+    return _AR6_AREA_WEIGHTS
+
+
+def _resolve_region(region, available):
+    """
+    Map the `region` argument to a list of region abbrevs.
+
+    - an AR6 abbrev (e.g. "EAS"), or any other entry present in the file
+      (e.g. a synthetic "GLOBAL" mask entry): that single region;
+    - "GLOBAL" (when the file has no such entry): all AR6 regions in the file;
+    - "LAND": all AR6 land regions in the file.
+    """
+    key = region.upper()
+    if region in available:
+        return [region]
+    if key == "GLOBAL":
+        regions = [r for r in regionmask.defined_regions.ar6.all.abbrevs if r in available]
+    elif key == "LAND":
+        regions = [r for r in regionmask.defined_regions.ar6.land.abbrevs if r in available]
+    else:
+        raise KeyError(f"Region '{region}' not found; use one of {available}, 'GLOBAL' or 'LAND'")
+    if not regions:
+        raise KeyError(f"No AR6 regions for '{region}' found in {available}")
+    return regions
+
+
+def _load_yearly_realisations(monthly_nc, region="GLOBAL", esm=None, var="tas",
+                              area_weighted=True, batch_size=100):
+    """
+    Read a monthly projection file written by `run_projections_and_save`
+    (dims esm, realisation, time, region) and reduce it to annual means,
+    one series per (ESM, realisation).
+
+    `region` is a single region spec or a list of them. A spec is a region
+    abbrev, "GLOBAL" (all AR6 regions in the file) or "LAND" (AR6 land
+    regions), see `_resolve_region`; averages are area-weighted unless
+    `area_weighted=False`. `esm=None` pools the realisations of all ESMs; a
+    string (or list) selects ESM(s).
+
+    Returns (years, data) with data of shape (n_series, n_years) for a single
+    spec, or (years, {spec: data}) for a list. The file is read once, in
+    batches of realisations, so many regions can be extracted cheaply.
+    """
+    single = isinstance(region, str)
+    specs = [region] if single else list(region)
+
+    ds = xr.open_dataset(monthly_nc, use_cftime=True)
+    try:
+        available = [str(r) for r in ds["region"].values]
+        plan = {}
+        for spec in specs:
+            regs = _resolve_region(spec, available)
+            w = np.array([_ar6_area_weights()[r] if (area_weighted and len(regs) > 1) else 1.0
+                          for r in regs])
+            plan[spec] = ([available.index(r) for r in regs], w / w.sum())
+
+        da = ds[var]
+        if "esm" not in da.dims:
+            da = da.expand_dims("esm")
+        if esm is not None:
+            da = da.sel(esm=[esm] if isinstance(esm, str) else list(esm))
+        da = da.transpose("esm", "realisation", "time", "region")
+
+        years_t = np.asarray(ds["time"].dt.year.values, dtype=int)
+        if np.any(np.diff(years_t) < 0):
+            raise ValueError(f"Time axis of {monthly_nc} is not sorted")
+        years, starts, counts = np.unique(years_t, return_index=True, return_counts=True)
+
+        out = {spec: [] for spec in specs}
+        for e in range(da.sizes["esm"]):
+            for r0 in range(0, da.sizes["realisation"], batch_size):
+                block = da.isel(esm=e, realisation=slice(r0, r0 + batch_size)).values
+                yearly = (np.add.reduceat(block, starts, axis=1, dtype=np.float64)
+                          / counts[None, :, None])                       # (b, year, region)
+                for spec, (idx, w) in plan.items():
+                    out[spec].append(yearly[:, :, idx] @ w)
+    finally:
+        ds.close()
+
+    data = {spec: np.concatenate(v, axis=0) for spec, v in out.items()}
+    return (years, data[region]) if single else (years, data)
+
+
+def _trend_per_decade(years, data, y0, y1):
+    """Least-squares linear trend (per decade) of every row of `data` over [y0, y1]."""
+    sel = (years >= y0) & (years <= y1)
+    if sel.sum() < 2:
+        return np.full(data.shape[0], np.nan)
+    x = years[sel] - years[sel].mean()
+    return 10 * (data[:, sel] @ x) / (x @ x)
+
+
+def _quantile_levels(bands):
+    return sorted({0.5, *[q for pair in bands for q in pair]})
+
+
+def _scenario_stats(years, data, qs, smooth_years, start_year, split_year,
+                    rate_windows, rate_change_windows):
+    """Per-realisation derived quantities of one scenario/region, summarised as
+    {quantile: value} dicts (see `plot_peak_warming_analysis`)."""
+    def _quantiles(x, axis=0):
+        vals = np.nanquantile(x, qs, axis=axis)
+        return {q: v for q, v in zip(qs, vals)}
+
+    if smooth_years > 1:
+        smooth = (pd.DataFrame(data.T)
+                  .rolling(smooth_years, center=True, min_periods=1).mean().values.T)
+    else:
+        smooth = data
+
+    def _at(year):
+        idx = np.where(years == year)[0]
+        return smooth[:, idx[0]] if len(idx) else np.full(data.shape[0], np.nan)
+
+    (r0y0, r0y1), (r1y0, r1y1) = rate_change_windows
+    rate_ref = _trend_per_decade(years, smooth, r0y0, r0y1)
+    rate_tgt = _trend_per_decade(years, smooth, r1y0, r1y1)
+    valid = rate_ref > 0
+    rate_change = np.where(valid, 100 * (rate_tgt - rate_ref) / np.where(valid, rate_ref, 1), np.nan)
+
+    after = years >= start_year
+    return dict(
+        years=years,
+        q=_quantiles(data, axis=0),                              # trajectories
+        peak=_quantiles(np.nanmax(smooth[:, after], axis=1)),
+        peak_year=_quantiles(years[after][np.nanargmax(smooth[:, after], axis=1)].astype(float)),
+        split=_quantiles(_at(split_year)),
+        end=_quantiles(smooth[:, -1]),
+        rates=[_quantiles(_trend_per_decade(years, smooth, y0, y1)) for y0, y1 in rate_windows],
+        rate_change=_quantiles(rate_change) if valid.any() else {q: np.nan for q in qs},
+        rate_change_excluded=int((~valid).sum()), n_series=data.shape[0],
+    )
+
+
+def _compute_peak_warming_stats(monthly_files, scenario_names, regions, esm, var,
+                                area_weighted, bands, smooth_years, start_year,
+                                split_year, rate_windows, rate_change_windows):
+    """
+    Read every scenario file once and return {region: [scenario stats, ...]}
+    (scenarios in the order of `monthly_files`). Only the small per-region
+    summaries are kept in memory, never more than one file's yearly data.
+    """
+    qs = _quantile_levels(bands)
+    stats = {r: [] for r in regions}
+    for path in monthly_files:
+        name = scenario_names.get(path, scenario_names.get(os.path.basename(path)))
+        if name is None:
+            raise KeyError(f"No scenario name given for {path}")
+        years, data = _load_yearly_realisations(path, region=list(regions), esm=esm, var=var,
+                                                area_weighted=area_weighted)
+        for r in regions:
+            s = _scenario_stats(years, data[r], qs, smooth_years, start_year, split_year,
+                                rate_windows, rate_change_windows)
+            s["name"] = name
+            stats[r].append(s)
+        print(f"  {name}: {next(iter(data.values())).shape[0]} series, "
+              f"{years[0]}-{years[-1]}, {len(regions)} region(s)", flush=True)
+        del data
+    return stats
+
+
+def plot_peak_warming_analysis(monthly_files, scenario_names, region="GLOBAL", esm=None,
+                               var="tas", bands=((0.05, 0.95), (0.17, 0.83), (0.33, 0.67)),
+                               rate_windows=((2016, 2025), (2026, 2035), (2031, 2040),
+                                             (2036, 2045), (2041, 2050)),
+                               split_year=2100, high_scenarios=None, observed=None,
+                               colors=None, area_weighted=True, smooth_years=1,
+                               start_year=2000, rate_change_windows=((2016, 2025), (2036, 2045)),
+                               rate_change_focus="VL", only_rate_change=False,
+                               save_path=None, scenario_stats=None):
+    """
+    Multi-scenario summary figure (warming trajectories, peak year, rate of
+    warming, peak warming, warming in `split_year` / at the final year and the
+    percentage change of the warming rate between two windows).
+
+    Parameters
+    ----------
+    monthly_files : list of str
+        Monthly projection netCDF files written by `run_projections_and_save`
+        (one per scenario). Plot order follows this list.
+    scenario_names : dict
+        {filename: short scenario name}, e.g.
+        {"SSP1---Very-Low-Emissions_..._tas_pr_monthly_scales.nc": "VL"}.
+        Keys may be full paths or basenames.
+    region : str
+        What to analyse:
+        - a single region abbrev, e.g. "EAS";
+        - "GLOBAL": average over all AR6 regions in the file (land + ocean);
+        - "LAND":   average over the 46 AR6 land regions.
+    area_weighted : bool
+        Weight the "GLOBAL"/"LAND" averages by region area (default) instead
+        of giving every region the same weight.
+    esm : str, list of str or None
+        ESM(s) to use; None pools the realisations of all ESMs.
+    bands : sequence of (lo, hi) quantile pairs
+        Uncertainty boxes / shading, outermost first (the outermost band is
+        the shading in panels a, b).
+    smooth_years : int
+        Width of a centred running mean (in years) applied to every annual
+        series before computing peak year, peak warming and the warming in
+        `split_year` / the final year, and the warming rates (panels e, i).
+        1 = no smoothing; the per-realisation values then include the full
+        interannual variability, which dominates 10-year regional trends.
+        The trajectories in panels a, b always use the unsmoothed annual means.
+    start_year : int
+        First year shown in panels a and c; peaks are searched from this year on.
+    rate_change_windows : ((y0, y1), (y0, y1))
+        Reference and target window for panel i, the percentage change of the
+        warming rate, 100 * (rate_target - rate_ref) / rate_ref, computed per
+        realisation. Realisations with rate_ref <= 0 are excluded (their
+        count is printed under the box).
+    rate_change_focus : str or None
+        Scenario highlighted in panel i (others are drawn faded); None = no highlight.
+    only_rate_change : bool
+        If True, only panel i is plotted (as a small stand-alone figure).
+    split_year : int
+        Boundary between the near-term (a, c) and long-term (b, d) panels,
+        and the year shown in panel g.
+    high_scenarios : list of str or None
+        Short names shown on the separate right-hand y-axis in panels f-h.
+        None: scenarios whose median peak exceeds twice the smallest median peak.
+    observed : dict or None
+        Optional {label: (years, values)} reference series drawn in panel a
+        (first one solid with markers, others dashed, all in black).
+    colors : dict or None
+        {short name: color}; defaults to SCENARIO_COLORS, then the tab10 cycle.
+    save_path : str or None
+        If given, the figure is saved there.
+    scenario_stats : list or None
+        Pre-computed statistics for this region (used internally by
+        `plot_peak_warming_analysis_by_region`); if given, no files are read.
+
+    Notes
+    -----
+    Every (ESM, realisation) series is first reduced to annual means of the
+    (area-weighted) regional average; peak year, peak warming, warming rates
+    etc. are computed per series and the quantiles are taken across series.
+    """
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.lines import Line2D
+
+    if scenario_stats is None:
+        scenario_stats = _compute_peak_warming_stats(
+            monthly_files, scenario_names, [region], esm, var, area_weighted, bands,
+            smooth_years, start_year, split_year, rate_windows, rate_change_windows)[region]
+
+    colors = {**SCENARIO_COLORS, **(colors or {})}
+    fallback = iter(plt.cm.tab10.colors)
+    scen = [dict(s, color=colors[s["name"]] if s["name"] in colors else next(fallback))
+            for s in scenario_stats]
+    band_pairs = list(bands)
+    alphas = np.linspace(0.3, 0.75, len(band_pairs))
+    band_txt = ", ".join(f"{int(lo*100)}–{int(hi*100)}%" for lo, hi in band_pairs)
+    esm_txt = esm if esm is not None else "all ESMs pooled"
+    footer = f"Region: {region}  |  ESM: {esm_txt}  |  boxes: {band_txt}, line = median"
+
+    # ── Drawing helpers ─────────────────────────────────────────────────────
+    def _box(ax, x, stats, color, width=0.6, horizontal=False, alpha_scale=1.0):
+        for (qlo, qhi), a in zip(band_pairs, alphas * alpha_scale):
+            lo, hi = sorted((stats[qlo], stats[qhi]))
+            if np.isnan(lo) or np.isnan(hi):
+                continue
+            if horizontal:
+                ax.barh(x, hi - lo, left=lo, height=width, color=color, alpha=a,
+                        edgecolor="k", linewidth=0.6)
+            else:
+                ax.bar(x, hi - lo, bottom=lo, width=width, color=color, alpha=a,
+                       edgecolor="k", linewidth=0.4)
+        med = stats[0.5]
+        if horizontal:
+            ax.vlines(med, x - width / 2, x + width / 2, color="k", linewidth=1.0)
+        else:
+            if not np.isnan(med):
+                ax.hlines(med, x - width / 2, x + width / 2, color="w", linewidth=1.5)
+
+    def _style(ax):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, axis="y", linestyle="-", linewidth=0.5, alpha=0.3)
+
+    def _draw_rate_change(ax, title_fontsize=9, title_prefix=""):
+        (r0y0, r0y1), (r1y0, r1y1) = rate_change_windows
+        for i, s in enumerate(scen):
+            focus = rate_change_focus is None or s["name"] == rate_change_focus
+            _box(ax, i, s["rate_change"], s["color"], width=0.7,
+                 alpha_scale=1.0 if focus else 0.4)
+            if s["rate_change_excluded"]:
+                ax.annotate(f"{s['rate_change_excluded']}/{s['n_series']}\nexcl.",
+                            (i, 0), xycoords=("data", "axes fraction"), xytext=(0, 2),
+                            textcoords="offset points", ha="center", va="bottom",
+                            fontsize=5.5, color="0.4")
+            if rate_change_focus is not None and s["name"] == rate_change_focus \
+                    and not np.isnan(s["rate_change"][0.5]):
+                ax.annotate(f"{s['rate_change'][0.5]:+.0f}%", (i + 0.35, s["rate_change"][0.5]),
+                            xytext=(2, 0), textcoords="offset points", va="center",
+                            fontsize=8, fontweight="bold", color=s["color"])
+        ax.set_xticks(range(len(scen)))
+        ax.set_xticklabels([s["name"] for s in scen], fontsize=8)
+        ax.set_xlim(-0.6, len(scen) - 0.4)
+        ax.axhline(0, color="k", linewidth=0.6)
+        ax.set_ylabel("Change in rate of warming (%)")
+        ax.set_title(f"{title_prefix}{r1y0}–{r1y1} vs\n{r0y0}–{r0y1}", fontsize=title_fontsize, loc="left")
+        _style(ax)
+
+    def _save(fig):
+        if save_path is not None:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Plot saved -> {save_path}", flush=True)
+        return fig
+
+    # ── Panel i only ────────────────────────────────────────────────────────
+    if only_rate_change:
+        fig, ax_i = plt.subplots(figsize=(4.5, 4.5), dpi=150)
+        _draw_rate_change(ax_i, title_fontsize=10, title_prefix=f"{region}: ")
+        fig.text(0.5, -0.02, footer, ha="center", va="top", fontsize=6.5, color="0.4")
+        return _save(fig)
+
+    end_year = int(min(s["years"].max() for s in scen))
+    if high_scenarios is None:
+        min_peak = min(s["peak"][0.5] for s in scen)
+        high_scenarios = [s["name"] for s in scen if s["peak"][0.5] > 2 * max(min_peak, 1e-6)]
+    low = [s for s in scen if s["name"] not in high_scenarios]
+    high = [s for s in scen if s["name"] in high_scenarios]
+
+    # ── Layout ──────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(11, 15), dpi=150)
+    gs = GridSpec(4, 2, figure=fig, height_ratios=[3, 1.8, 2.4, 2.4],
+                  hspace=0.35, wspace=0.12, top=0.94, bottom=0.05)
+    ax_a, ax_b = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[1, 0])
+    ax_d = fig.add_subplot(gs[1, 1], sharey=ax_c)
+    gs_mid = gs[2, :].subgridspec(1, 2, width_ratios=[4, 1.1], wspace=0.22)
+    ax_e = fig.add_subplot(gs_mid[0, 0])
+    ax_i = fig.add_subplot(gs_mid[0, 1])
+    gs_bot = gs[3, :].subgridspec(1, 3, wspace=0.3)
+
+    # a, b — trajectories
+    qlo, qhi = band_pairs[0]
+    for ax, (x0, x1) in ((ax_a, (start_year, split_year)), (ax_b, (split_year, end_year))):
+        for s in scen:
+            sel = (s["years"] >= x0) & (s["years"] <= x1)
+            ax.fill_between(s["years"][sel], s["q"][qlo][sel], s["q"][qhi][sel],
+                            color=s["color"], alpha=0.18, linewidth=0)
+            ax.plot(s["years"][sel], s["q"][0.5][sel], color=s["color"], linewidth=1.6)
+        ax.axhline(0, color="k", linewidth=0.6)
+        ax.set_xlim(x0, x1)
+        _style(ax)
+    if observed:
+        for i, (label, (oy, ov)) in enumerate(observed.items()):
+            oy, ov = np.asarray(oy), np.asarray(ov)
+            sel = oy >= start_year
+            ax_a.plot(oy[sel], ov[sel], color="k", linewidth=1.0,
+                      linestyle="-" if i == 0 else "--",
+                      marker="o" if i == 0 else None, markersize=2, label=label)
+        ax_a.legend(loc="upper left", fontsize=8, frameon=False)
+    ax_a.set_ylabel(f"Warming ({var}, {region}) [K]")
+
+    # c, d — peak year
+    ypos = {s["name"]: i for i, s in enumerate(scen)}
+    for ax, (x0, x1) in ((ax_c, (start_year, split_year)), (ax_d, (split_year, end_year))):
+        for s in scen:
+            _box(ax, ypos[s["name"]], s["peak_year"], s["color"], width=0.6, horizontal=True)
+        ax.set_xlim(x0, x1)
+        ax.set_xlabel("Year")
+        ax.grid(True, axis="x", linestyle="-", linewidth=0.5, alpha=0.3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+    ax_c.set_yticks(range(len(scen)))
+    ax_c.set_yticklabels([s["name"] for s in scen])
+    ax_c.invert_yaxis()
+    ax_c.set_ylabel("Peak year")
+    plt.setp(ax_d.get_yticklabels(), visible=False)
+
+    # e — rate of warming
+    n = len(scen)
+    group_w = n + 1.5
+    for w, (y0, y1) in enumerate(rate_windows):
+        for i, s in enumerate(scen):
+            _box(ax_e, w * group_w + i, s["rates"][w], s["color"], width=0.75)
+        if w:
+            ax_e.axvline(w * group_w - 1.25, color="0.8", linewidth=0.6)
+    ax_e.set_xticks([w * group_w + (n - 1) / 2 for w in range(len(rate_windows))])
+    ax_e.set_xticklabels([f"{y0}–{y1}" for y0, y1 in rate_windows])
+    ax_e.set_xlim(-1, len(rate_windows) * group_w - 1.5)
+    ax_e.axhline(0, color="k", linewidth=0.6)
+    ax_e.set_ylabel("Rate of warming (K / decade)")
+    _style(ax_e)
+
+    # i — percentage change of the warming rate between two windows
+    _draw_rate_change(ax_i)
+
+    # f, g, h — peak warming, warming in split_year, warming at end
+    bottom = [("peak", f"Peak warming (to {end_year})"),
+              ("split", f"Warming in {split_year}"),
+              ("end", f"Warming in {end_year}")]
+    bottom_axes = []
+    for k, (key, title) in enumerate(bottom):
+        groups = [g for g in (low, high) if g]
+        sub = gs_bot[0, k].subgridspec(1, len(groups), wspace=0.35,
+                                       width_ratios=[len(g) + 0.5 for g in groups])
+        for j, group in enumerate(groups):
+            ax = fig.add_subplot(sub[0, j])
+            for i, s in enumerate(group):
+                _box(ax, i, s[key], s["color"], width=0.7)
+            ax.set_xticks(range(len(group)))
+            ax.set_xticklabels([s["name"] for s in group])
+            ax.set_xlim(-0.6, len(group) - 0.4)
+            ax.axhline(0, color="k", linewidth=0.6)
+            _style(ax)
+            if j == 0:
+                ax.set_title(title, fontsize=10, loc="left")
+            bottom_axes.append(ax)
+            if k == 0 and j == 0:
+                ax.set_ylabel("Warming (K)")
+
+    # Panel letters
+    letter_axes = [ax_a, ax_b, ax_c, ax_d, ax_e] + \
+        [bottom_axes[i] for i in range(0, len(bottom_axes), max(1, len(bottom_axes) // 3))]
+    letter_axes.append(ax_i)
+    for letter, ax in zip("abcdefghi", letter_axes):
+        ax.text(-0.02, 1.02, f"{letter})", transform=ax.transAxes, fontsize=11,
+                fontweight="bold", ha="right", va="bottom")
+
+    # Scenario legend
+    handles = [Line2D([0], [0], color=s["color"], linewidth=2.5) for s in scen]
+    fig.legend(handles, [s["name"] for s in scen], loc="upper center", ncol=len(scen),
+               frameon=False, title="Scenario", bbox_to_anchor=(0.5, 0.995))
+    fig.text(0.5, 0.01, footer, ha="center", fontsize=8, color="0.4")
+    return _save(fig)
+
+
+def plot_peak_warming_analysis_by_region(monthly_files, scenario_names, out_dir,
+                                         regions=None, file_prefix="peak_warming",
+                                         file_format="png", **kwargs):
+    """
+    Run `plot_peak_warming_analysis` for every region in `regions` (default:
+    the 46 AR6 land regions) and save each figure to
+    <out_dir>/<file_prefix>_<region>.<file_format>
+    (with "_rate_change" appended when only_rate_change=True).
+
+    All other keyword arguments (esm, smooth_years, only_rate_change, ...) are
+    passed on to `plot_peak_warming_analysis`. Each scenario file is read only
+    once for all regions. Returns {region: saved path}.
+    """
+    import inspect
+
+    if regions is None:
+        regions = list(regionmask.defined_regions.ar6.land.abbrevs)
+    for bad in ("region", "save_path", "scenario_stats"):
+        if bad in kwargs:
+            raise TypeError(f"'{bad}' is set per region and cannot be passed")
+
+    defaults = {k: p.default for k, p in
+                inspect.signature(plot_peak_warming_analysis).parameters.items()
+                if p.default is not inspect.Parameter.empty}
+    opts = {**defaults, **kwargs}
+    stats = _compute_peak_warming_stats(
+        monthly_files, scenario_names, regions, opts["esm"], opts["var"],
+        opts["area_weighted"], opts["bands"], opts["smooth_years"], opts["start_year"],
+        opts["split_year"], opts["rate_windows"], opts["rate_change_windows"])
+
+    os.makedirs(out_dir, exist_ok=True)
+    suffix = "_rate_change" if opts["only_rate_change"] else ""
+    saved = {}
+    for region in regions:
+        path = os.path.join(out_dir, f"{file_prefix}_{region}{suffix}.{file_format}")
+        fig = plot_peak_warming_analysis(monthly_files, scenario_names, region=region,
+                                         save_path=path, scenario_stats=stats[region], **kwargs)
+        plt.close(fig)
+        saved[region] = path
+    return saved
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

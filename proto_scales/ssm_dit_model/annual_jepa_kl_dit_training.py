@@ -77,6 +77,7 @@ def run_train(
     grad_clip=1.0,
     run_dir=None,
     weights_file=None,
+    weights_key="model",
     ckpt_every=10,
     seed=0,
 ):
@@ -198,10 +199,29 @@ def run_train(
 
     if weights_file is not None:
         ckpt = torch.load(weights_file, map_location=device)
+        # Epoch checkpoints are saved as {"model": ..., "ema": ...}; the final
+        # `model_out` is a bare state dict. Unwrap the former.
+        if isinstance(ckpt, dict) and ("model" in ckpt or "ema" in ckpt):
+            if weights_key not in ckpt:
+                raise KeyError(f"[dit] checkpoint {weights_file} has keys "
+                               f"{list(ckpt.keys())}, no '{weights_key}' entry")
+            ckpt = ckpt[weights_key]
+            src = f"{weights_file} ['{weights_key}']"
+        else:
+            src = weights_file
         missing, unexpected = raw_model.load_state_dict(ckpt, strict=False)
+        n_model = len(raw_model.state_dict())
+        n_loaded = n_model - len(missing)
+        if n_loaded == 0:
+            raise RuntimeError(f"[dit] warm start from {src} matched none of the "
+                               f"{n_model} model keys — wrong file or architecture?")
         if is_main:
-            print(f"[dit] warm start from {weights_file} | missing {len(missing)} | "
-                  f"unexpected {len(unexpected)}")
+            print(f"[dit] warm start from {src} | loaded {n_loaded}/{n_model} | "
+                  f"missing {len(missing)} | unexpected {len(unexpected)}")
+            if missing:
+                print(f"[dit]   missing (first 10): {missing[:10]}")
+            if unexpected:
+                print(f"[dit]   unexpected (first 10): {unexpected[:10]}")
 
     n_par = sum(p.numel() for p in raw_model.parameters())
     n_tr = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
