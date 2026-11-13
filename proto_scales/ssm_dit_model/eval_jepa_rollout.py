@@ -52,6 +52,7 @@ Everything is also saved to `<out_dir>/eval_jepa_rollout.npz`.
 import argparse
 import ast
 import os
+import re
 from contextlib import contextmanager
 
 import matplotlib
@@ -92,6 +93,71 @@ def read_config(run_dir):
             except (ValueError, SyntaxError):
                 cfg[k] = v
     return cfg
+
+
+CKPT_RE = re.compile(r"annual_jepa_kl_dit_epoch(\d+)\.pt$")
+
+
+def zstats_path(path):
+    """Where `fit_jepa_kl_z_stats` writes the fitted copy of `path`."""
+    root, ext = os.path.splitext(path)
+    return f"{root}_zstats{ext}" if ext == ".pt" else f"{path}_zstats"
+
+
+def list_checkpoints(run_dir):
+    """{epoch: path} of the epoch checkpoints in <run_dir>/checkpoints."""
+    d = os.path.join(run_dir, "checkpoints")
+    if not os.path.isdir(d):
+        return {}
+    out = {}
+    for f in os.listdir(d):
+        m = CKPT_RE.match(f)
+        if m:
+            out[int(m.group(1))] = os.path.join(d, f)
+    return out
+
+
+def resolve_weights(run_dir, weights=None, checkpoint=None, prefer_zstats=True):
+    """
+    Pick the weights file. Order: explicit `weights` path; `checkpoint`
+    ('latest' or an epoch number) from <run_dir>/checkpoints; otherwise
+    <run_dir>/model_out, or the latest epoch checkpoint if training hasn't
+    finished yet. With `prefer_zstats`, a fitted copy written by
+    `fit_jepa_kl_z_stats` next to the chosen file is used if it exists.
+    Returns (path, tag) — tag names the source, e.g. 'epoch0160' / 'model_out'.
+    """
+    if weights:
+        path = weights
+    else:
+        ckpts = list_checkpoints(run_dir)
+        final = os.path.join(run_dir, "model_out")
+        if checkpoint is None and os.path.exists(final):
+            path = final
+        else:
+            if not ckpts:
+                raise SystemExit(f"no model_out and no epoch checkpoints in {run_dir}")
+            if checkpoint in (None, "latest"):
+                ep = max(ckpts)
+                if checkpoint is None:
+                    print(f"[weights] no model_out yet -> latest checkpoint, epoch {ep}")
+            else:
+                ep = int(checkpoint)
+                if ep not in ckpts:
+                    raise SystemExit(f"no checkpoint for epoch {ep}; have {sorted(ckpts)}")
+            path = ckpts[ep]
+    base = os.path.basename(path)
+    for suf in ("_zstats.pt", "_zstats", ".pt"):
+        if base.endswith(suf):
+            base = base[:-len(suf)]
+            break
+    m = re.search(r"epoch(\d+)", base)
+    tag = f"epoch{m.group(1)}" if m else base
+    if prefer_zstats and not path.endswith(("_zstats", "_zstats.pt")):
+        zp = zstats_path(path)
+        if os.path.exists(zp):
+            print(f"[weights] using fitted copy {zp}")
+            path = zp
+    return path, tag
 
 
 def load_jepa(run_dir, weights, weights_key, cfg, y_dim, u_dim):
@@ -279,8 +345,17 @@ def plot_long(res, u, order, efold, bnorm, ctx, tag, out_dir, key_a="z_roll",
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--run_dir", required=True)
-    p.add_argument("--weights", default=None, help="default: <run_dir>/model_out")
-    p.add_argument("--weights_key", default="ema", choices=["ema", "model"])
+    p.add_argument("--weights", default=None,
+                   help="explicit weights file; overrides --checkpoint")
+    p.add_argument("--checkpoint", default=None,
+                   help="'latest' or an epoch number from <run_dir>/checkpoints. Default: "
+                        "model_out, or the latest checkpoint if training hasn't finished. "
+                        "A fitted *_zstats copy next to it is used if present")
+    p.add_argument("--weights_key", default="ema", choices=["ema", "model"],
+                   help="which weights of an epoch checkpoint {model, ema}")
+    p.add_argument("--fit_z_stats", action="store_true",
+                   help="fit the z stats in memory before evaluating (loads the training "
+                        "data, as fit_jepa_kl_z_stats does) instead of needing a *_zstats file")
     p.add_argument("--cluster", default="IIASA", choices=list(MODEL_PATHS))
     p.add_argument("--esm", default="ACCESS-ESM1-5")
     p.add_argument("--scenarios", nargs="+", default=["ssp126"])
@@ -295,7 +370,8 @@ def main():
     cfg = read_config(args.run_dir)
     ctx = args.context_years or cfg.get("context_len", 120) // MONTHS
     H = args.horizon_years or cfg.get("horizon", 1200) // MONTHS
-    out_dir = args.out_dir or os.path.join(args.run_dir, "eval_rollout")
+    weights, wtag = resolve_weights(args.run_dir, args.weights, args.checkpoint)
+    out_dir = args.out_dir or os.path.join(args.run_dir, f"eval_rollout_{wtag}")
     os.makedirs(out_dir, exist_ok=True)
 
     S = scales_ssm.StandardScaler
@@ -308,7 +384,10 @@ def main():
     if not trajs:
         raise SystemExit(f"no files found for {args.scenarios}")
     y_dim = trajs[0]["tas"].shape[1]
-    jepa = load_jepa(args.run_dir, args.weights, args.weights_key, cfg, y_dim, 1)
+    jepa = load_jepa(args.run_dir, weights, args.weights_key, cfg, y_dim, 1)
+    if args.fit_z_stats:
+        from proto_scales.fit_jepa_kl_z_stats import fit_on_training_set
+        fit_on_training_set(jepa, args.run_dir, cfg, args.cluster)
 
     efold = jepa.efolding_years().numpy()
     bnorm = jepa.B.weight.detach().norm(dim=1).numpy()
