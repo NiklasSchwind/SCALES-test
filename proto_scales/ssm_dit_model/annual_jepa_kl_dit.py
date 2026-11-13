@@ -178,6 +178,18 @@ class ForcedAnnualJEPAKL(nn.Module):
                         an approximation of the conditional mean, exactly as
                         with `trans_hidden`.
     gate_hidden       : hidden width of the decay gate MLP.
+    monthly_encoder   : run both GRUs over the *monthly* field and forcing and
+                        read z off at each year end (December), instead of
+                        over annual means. The transition, rollout and z stay
+                        annual. Reason: a GRU started from h0 = 0 has a warm-up
+                        transient of some number of *steps*; on annual input a
+                        10-year context is only 10 steps, shorter than that
+                        transient, so z_last was read mid-warm-up. Monthly
+                        input gives 120 steps for the same context, as in the
+                        original monthly SSM. Encoder inputs then come from
+                        `encoder_inputs(y_monthly, u_monthly)`; every method
+                        that encodes takes those, and transition forcing is
+                        passed separately in annual units.
     """
 
     def __init__(
@@ -192,6 +204,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         normalize_z=True,
         gated_decay=False,
         gate_hidden=32,
+        monthly_encoder=False,
     ):
         super().__init__()
         lo, hi = decay_efold_range
@@ -204,6 +217,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         self.target_decay = float(target_decay)
         self.normalize_z = bool(normalize_z)
         self.gated_decay = bool(gated_decay)
+        self.monthly_encoder = bool(monthly_encoder)
 
         # Online encoder: causal read of the field, now a Gaussian.
         self.gru = nn.GRU(obs_dim + u_dim, rnn_hidden, batch_first=True)
@@ -251,6 +265,11 @@ class ForcedAnnualJEPAKL(nn.Module):
                           nn.Linear(trans_hidden, z_dim))
             if trans_hidden else None
         )
+        if self.trans_mlp is not None:
+            # Start from the linear model, as the gate does: the correction
+            # grows only as far as the losses ask for it.
+            nn.init.zeros_(self.trans_mlp[-1].weight)
+            nn.init.zeros_(self.trans_mlp[-1].bias)
 
         # Prior variance: a single learned per-dimension parameter, exactly as
         # in `ForcedAnnualSSM` — not something recursively propagated through
@@ -369,22 +388,43 @@ class ForcedAnnualJEPAKL(nn.Module):
         std = z.std(dim=(0, 1), keepdim=True).clamp(min=1e-4)
         return (z - mean) / std
 
-    def _raw_online(self, y, u):
-        h, _ = self.gru(torch.cat([y, u], dim=-1))
-        return torch.chunk(self.q_head(h), 2, dim=-1)
+    def encoder_inputs(self, y_monthly, u_monthly):
+        """
+        What the encoders read, from monthly field/forcing [B, T, .]: the
+        monthly series themselves with `monthly_encoder`, annual means
+        otherwise. Pass the result to `posterior` / `encode` / `encode_target`
+        / the losses.
+        """
+        if self.monthly_encoder:
+            return y_monthly, u_monthly
+        return to_annual(y_monthly), to_annual(u_monthly)
+
+    def _run_gru(self, gru, ye, ue):
+        """[B, T_enc, h] -> [B, Y, h]: one state per year (year end if monthly)."""
+        h, _ = gru(torch.cat([ye, ue], dim=-1))
+        if self.monthly_encoder:
+            T = h.shape[1]
+            # December of each year; a trailing partial year reads its last month,
+            # matching `to_annual`'s partial-year mean.
+            idx = torch.arange(11, T + 11, 12, device=h.device).clamp(max=T - 1)
+            h = h[:, idx]
+        return h
+
+    def _raw_online(self, ye, ue):
+        return torch.chunk(self.q_head(self._run_gru(self.gru, ye, ue)), 2, dim=-1)
 
     @torch.no_grad()
-    def _raw_target(self, y, u):
-        h, _ = self.target_gru(torch.cat([y, u], dim=-1))
-        return torch.chunk(self.target_q_head(h), 2, dim=-1)[0]
+    def _raw_target(self, ye, ue):
+        return torch.chunk(self.target_q_head(self._run_gru(self.target_gru, ye, ue)), 2, dim=-1)[0]
 
     @torch.no_grad()
     def fit_z_stats(self, batches):
         """
         Fit the fixed standardization stats once, on the training set.
-        `batches` yields (y_ctx, u_ctx, y_full, u_full) in annual units:
-        context-length windows for the online stats, context+horizon windows
-        for the target stats (the frames each is read in during training).
+        `batches` yields (ye_ctx, ue_ctx, ye_full, ue_full) — encoder inputs
+        (`encoder_inputs`, monthly or annual by mode): context-length windows
+        for the online stats, context+horizon windows for the target stats
+        (the frames each is read in during training).
         Pooled over windows and time, per dimension.
         """
         acc = {k: [0.0, 0.0, 0] for k in ("on", "tgt")}
@@ -448,7 +488,10 @@ class ForcedAnnualJEPAKL(nn.Module):
     # latent trajectories — same interface as ForcedAnnualSSM / ForcedAnnualJEPA
     # -----------------------
     def posterior(self, y, u):
-        """Online encoding over an observed window. Returns ([B,Y,z], [B,z])."""
+        """
+        Online encoding over an observed window of encoder inputs
+        (`encoder_inputs`). Returns annual ([B,Y,z], [B,z]).
+        """
         z = self.encode(y, u)
         return z, z[:, -1]
 
@@ -475,7 +518,7 @@ class ForcedAnnualJEPAKL(nn.Module):
     # -----------------------
     # objectives
     # -----------------------
-    def jepa_kl_loss(self, y, u, kl_free_bits=0.05):
+    def jepa_kl_loss(self, ye, ue, u_ann, kl_free_bits=0.05):
         """
         One-step KL loss over a whole sequence: at every year t >= 1, KL the
         online posterior q(z_t) against a prior whose mean is
@@ -491,12 +534,15 @@ class ForcedAnnualJEPAKL(nn.Module):
         `kl_free_bits` clamps the per-dimension KL the same way
         `forward_elbo` does: insurance against the posterior trivially
         matching the prior on dimensions that have nothing to say.
-        """
-        B, T, _ = y.shape
-        mu_q, logvar_q = self._encode_dist(y, u)
-        z_target = self.encode_target(y, u)
 
-        mu_p = self.transition_mean(z_target[:, :-1], u[:, 1:])
+        `ye`/`ue` are encoder inputs (`encoder_inputs`); `u_ann` [B, Y, u] is
+        the annual forcing the transition is driven by.
+        """
+        mu_q, logvar_q = self._encode_dist(ye, ue)
+        z_target = self.encode_target(ye, ue)
+        B, T, _ = mu_q.shape
+
+        mu_p = self.transition_mean(z_target[:, :-1], u_ann[:, 1:])
         logvar_p = torch.clamp(self.log_process_var, -12.0, 6.0)
         logvar_p = logvar_p.view(1, 1, -1).expand(B, T - 1, -1)
 
@@ -504,7 +550,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         kl = torch.clamp(kl_dim, min=kl_free_bits).sum(dim=-1).sum(dim=1)
         return kl.mean() / ((T - 1) * self.z_dim)
 
-    def jepa_rollout_loss(self, y_ctx, u_ctx, y_fut, u_fut):
+    def jepa_rollout_loss(self, ye_ctx, ue_ctx, ye_fut, ue_fut, u_fut_ann):
         """
         Multi-step consistency: unchanged from `ForcedAnnualJEPA.jepa_rollout_loss`.
         From the online posterior's mean at the end of the context, roll
@@ -513,13 +559,16 @@ class ForcedAnnualJEPAKL(nn.Module):
         at every lead. There is no online, data-informed distribution over a
         blind forcing-only rollout, so there is nothing meaningful to KL here
         — this stays a plain MSE, exactly as in the plain-MSE JEPA model.
+
+        `ye_*`/`ue_*` are encoder inputs (`encoder_inputs`); `u_fut_ann` is the
+        annual future forcing the rollout is driven by.
         """
-        _, z_last = self.posterior(y_ctx, u_ctx)
-        z_traj = self.roll_forward(z_last, u_fut, stochastic=False)
+        z_ctx, z_last = self.posterior(ye_ctx, ue_ctx)
+        z_traj = self.roll_forward(z_last, u_fut_ann, stochastic=False)
         z_target_fut = self.encode_target(
-            torch.cat([y_ctx, y_fut], dim=1),
-            torch.cat([u_ctx, u_fut], dim=1),
-        )[:, y_ctx.shape[1]:]
+            torch.cat([ye_ctx, ye_fut], dim=1),
+            torch.cat([ue_ctx, ue_fut], dim=1),
+        )[:, z_ctx.shape[1]:]
         return ((z_traj - z_target_fut) ** 2).mean()
 
     def z_covariance_loss(self, y, u):
@@ -587,31 +636,32 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
         (`loss`), same job (shaping z beyond what the diffusion loss alone
         would), different objective. `ssm_encoder.ssm` is the
         `ForcedAnnualJEPAKL` instance — the attribute keeps the `ssm` name so
-        the shared `ForcedAnnualLatentEncoder` needs no changes.
+        the shared `ForcedAnnualLatentEncoder` can drive it.
         """
         enc = self.ssm_encoder
-        y_ctx_ann, u_ctx_ann, u_fut_ann = enc.annual_inputs(
-            tas_ctx, pr_ctx, u_ctx, u_fut)
-        y_fut_ann = to_annual(torch.cat([tas_fut, pr_fut], dim=-1))
-        y_ann = torch.cat([y_ctx_ann, y_fut_ann], dim=1)
-        u_ann = torch.cat([u_ctx_ann, u_fut_ann], dim=1)
+        jepa = enc.ssm
+        ye_ctx, ue_ctx = jepa.encoder_inputs(torch.cat([tas_ctx, pr_ctx], dim=-1), u_ctx)
+        ye_fut, ue_fut = jepa.encoder_inputs(torch.cat([tas_fut, pr_fut], dim=-1), u_fut)
+        ye = torch.cat([ye_ctx, ye_fut], dim=1)
+        ue = torch.cat([ue_ctx, ue_fut], dim=1)
+        u_fut_ann = to_annual(u_fut)
+        u_ann = torch.cat([to_annual(u_ctx), u_fut_ann], dim=1)
 
         parts = {}
-        total = torch.zeros((), device=y_ctx_ann.device)
+        total = torch.zeros((), device=ye.device)
 
         if self.jepa_weight > 0:
-            jepa_kl = enc.ssm.jepa_kl_loss(y_ann, u_ann, kl_free_bits=self.jepa_kl_free_bits)
+            jepa_kl = enc.ssm.jepa_kl_loss(ye, ue, u_ann, kl_free_bits=self.jepa_kl_free_bits)
             total = total + self.jepa_weight * jepa_kl
             parts["jepa_kl"] = jepa_kl.detach()
 
         if self.jepa_rollout_weight > 0:
-            roll = enc.ssm.jepa_rollout_loss(
-                y_ctx_ann, u_ctx_ann, y_fut_ann, u_fut_ann)
+            roll = enc.ssm.jepa_rollout_loss(ye_ctx, ue_ctx, ye_fut, ue_fut, u_fut_ann)
             total = total + self.jepa_rollout_weight * roll
             parts["jepa_rollout"] = roll.detach()
 
         if self.jepa_cov_weight > 0:
-            cov = enc.ssm.z_covariance_loss(y_ann, u_ann)
+            cov = enc.ssm.z_covariance_loss(ye, ue)
             total = total + self.jepa_cov_weight * cov
             parts["jepa_cov"] = cov.detach()
 
@@ -635,6 +685,7 @@ def build_model(y_dim, u_dim, device="cpu", jepa_weights=None, **kwargs):
         normalize_z=kwargs.pop("normalize_z", True),
         gated_decay=kwargs.pop("gated_decay", False),
         gate_hidden=kwargs.pop("gate_hidden", 32),
+        monthly_encoder=kwargs.pop("monthly_encoder", False),
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")

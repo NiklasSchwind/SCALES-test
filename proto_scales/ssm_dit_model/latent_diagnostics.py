@@ -75,9 +75,13 @@ def z_norm_by_context_length(model, tas_ctx, pr_ctx, u_ctx, context_lengths):
         pr_n = pr_ctx[:, -n:]
         u_n = u_ctx[:, -n:]
 
-        y_ann = to_annual(torch.cat([tas_n, pr_n], dim=-1))
-        u_ann = to_annual(u_n)
-        _, z_last = ssm.posterior(y_ann, u_ann)
+        if hasattr(ssm, "encoder_inputs"):
+            _, z_last = ssm.posterior(*ssm.encoder_inputs(
+                torch.cat([tas_n, pr_n], dim=-1), u_n))
+        else:
+            y_ann = to_annual(torch.cat([tas_n, pr_n], dim=-1))
+            u_ann = to_annual(u_n)
+            _, z_last = ssm.posterior(y_ann, u_ann)
 
         norms = z_last.norm(dim=-1)
         results.append({

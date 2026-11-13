@@ -380,7 +380,13 @@ class ForcedAnnualLatentEncoder(nn.Module):
         with ctx:
             y_ann, u_ctx_ann, u_fut_ann = self.annual_inputs(
                 tas_ctx, pr_ctx, u_ctx, u_fut)
-            z_ctx_ann, z_last = self.ssm.posterior(y_ann, u_ctx_ann)
+            if hasattr(self.ssm, "encoder_inputs"):
+                # Latent processes that choose their own encoder resolution
+                # (`ForcedAnnualJEPAKL(monthly_encoder=...)`).
+                z_ctx_ann, z_last = self.ssm.posterior(*self.ssm.encoder_inputs(
+                    torch.cat([tas_ctx, pr_ctx], dim=-1), u_ctx))
+            else:
+                z_ctx_ann, z_last = self.ssm.posterior(y_ann, u_ctx_ann)
             z_fut_ann = self.ssm.roll_forward(z_last, u_fut_ann, stochastic=stochastic)
             z = torch.cat([broadcast_to_monthly(z_ctx_ann, n_ctx),
                            broadcast_to_monthly(z_fut_ann, n_fut)], dim=1)

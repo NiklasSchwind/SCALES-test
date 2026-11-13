@@ -170,6 +170,7 @@ def load_jepa(run_dir, weights, weights_key, cfg, y_dim, u_dim):
         target_decay=cfg.get("target_decay", 0.996),
         normalize_z=cfg.get("normalize_z", True),
         gated_decay=cfg.get("gated_decay", False),
+        monthly_encoder=cfg.get("monthly_encoder", False),
         gate_hidden=cfg.get("gate_hidden", 32),
     )
     path = weights or os.path.join(run_dir, "model_out")
@@ -227,25 +228,31 @@ def load_trajectories(model_path, scenarios, monthly=True):
 # diagnostics
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def score_windows(jepa, y_ann, u_ann, ctx, H, starts, pooled):
+def score_windows(jepa, y_m, u_m, ctx, H, starts, pooled):
     """
-    y_ann [Y, 2R], u_ann [Y, 1] for one trajectory. Each start s gives
-    ctx = [s, s+ctx), fut = [s+ctx, s+ctx+H). Returns dict of arrays
+    y_m [T, 2R], u_m [T, 1] monthly, for one trajectory. Each start s (years)
+    gives ctx = years [s, s+ctx), fut = [s+ctx, s+ctx+H). The encoders read
+    `jepa.encoder_inputs` of each slice (monthly or annual by mode); the
+    rollout is driven by annual forcing. Returns dict of arrays
     [n_win, H, z]. `pooled` encodes all windows as one batch (shared
     standardization stats), otherwise one window at a time.
     """
-    Yc = torch.stack([y_ann[s:s + ctx] for s in starts])
-    Uc = torch.stack([u_ann[s:s + ctx] for s in starts])
-    Yf = torch.stack([y_ann[s + ctx:s + ctx + H] for s in starts])
-    Uf = torch.stack([u_ann[s + ctx:s + ctx + H] for s in starts])
+    M = MONTHS
+    Yc = torch.stack([y_m[s * M:(s + ctx) * M] for s in starts])
+    Uc = torch.stack([u_m[s * M:(s + ctx) * M] for s in starts])
+    Yf = torch.stack([y_m[(s + ctx) * M:(s + ctx + H) * M] for s in starts])
+    Uf = torch.stack([u_m[(s + ctx) * M:(s + ctx + H) * M] for s in starts])
 
     def run(yc, uc, yf, uf):
-        _, z_last = jepa.posterior(yc, uc)
-        z_roll = jepa.roll_forward(z_last, uf)
-        z_tgt_all = jepa.encode_target(torch.cat([yc, yf], 1), torch.cat([uc, uf], 1))
+        ye_c, ue_c = jepa.encoder_inputs(yc, uc)
+        ye_f, ue_f = jepa.encoder_inputs(yf, uf)
+        uf_ann = to_annual(uf)
+        _, z_last = jepa.posterior(ye_c, ue_c)
+        z_roll = jepa.roll_forward(z_last, uf_ann)
+        z_tgt_all = jepa.encode_target(torch.cat([ye_c, ye_f], 1), torch.cat([ue_c, ue_f], 1))
         z_tgt = z_tgt_all[:, ctx:]
         z_prev = z_tgt_all[:, ctx - 1:-1]
-        z_one = jepa.transition_mean(z_prev, uf)
+        z_one = jepa.transition_mean(z_prev, uf_ann)
         return z_last, z_roll, z_tgt, z_one
 
     if pooled:
@@ -264,15 +271,18 @@ def score_windows(jepa, y_ann, u_ann, ctx, H, starts, pooled):
 
 
 @torch.no_grad()
-def long_rollout(jepa, y_ann, u_ann, ctx):
-    y, u = y_ann[None], u_ann[None]
-    _, z_last = jepa.posterior(y[:, :ctx], u[:, :ctx])
-    z_roll = jepa.roll_forward(z_last, u[:, ctx:])
-    z_tgt_all = jepa.encode_target(y, u)
-    res = dict(z_roll=z_roll[0].numpy(), z_tgt=z_tgt_all[0, ctx:].numpy())
+def long_rollout(jepa, y_m, u_m, ctx):
+    """One rollout from the first `ctx` years to the end; y_m/u_m monthly [T, .]."""
+    y, u = y_m[None], u_m[None]
+    u_ann = to_annual(u)
+    _, z_last = jepa.posterior(*jepa.encoder_inputs(y[:, :ctx * MONTHS], u[:, :ctx * MONTHS]))
+    z_roll = jepa.roll_forward(z_last, u_ann[:, ctx:])
+    z_tgt_all = jepa.encode_target(*jepa.encoder_inputs(y, u))
+    res = dict(z_roll=z_roll[0].numpy(), z_tgt=z_tgt_all[0, ctx:].numpy(),
+               u_ann=u_ann[0].numpy())
     if jepa.gated_decay:
-        res["tau_roll"] = jepa.gated_efolding_years(z_last, u[:, ctx:])[0].numpy()
-        res["tau_tgt"] = torch.exp(jepa._log_tau(z_tgt_all[:, ctx - 1:-1], u[:, ctx:]))[0].numpy()
+        res["tau_roll"] = jepa.gated_efolding_years(z_last, u_ann[:, ctx:])[0].numpy()
+        res["tau_tgt"] = torch.exp(jepa._log_tau(z_tgt_all[:, ctx - 1:-1], u_ann[:, ctx:]))[0].numpy()
     return res
 
 
@@ -393,6 +403,7 @@ def main():
     bnorm = jepa.B.weight.detach().norm(dim=1).numpy()
     order = np.argsort(efold)
     print(f"[model] ctx {ctx} yr | horizon {H} yr | gated_decay {jepa.gated_decay} | "
+          f"monthly_encoder {jepa.monthly_encoder} | "
           f"normalize_z {jepa.normalize_z} | trans_mlp {jepa.trans_mlp is not None}")
 
     fitted = bool(jepa.z_stats_fitted) and jepa.normalize_z
@@ -406,19 +417,19 @@ def main():
         tas = tas_sc.transform(tr["tas"][None])[0]
         pr = pr_sc.transform(tr["pr"][None])[0]
         u = u_sc.transform(tr["u"][None])[0]
-        y_ann = to_annual(torch.tensor(np.concatenate([tas, pr], -1)[None], dtype=torch.float32))[0]
-        u_ann = to_annual(torch.tensor(u[None], dtype=torch.float32))[0]
-        Y = y_ann.shape[0]
+        y_m = torch.tensor(np.concatenate([tas, pr], -1), dtype=torch.float32)
+        u_m = torch.tensor(u, dtype=torch.float32)
+        Y = y_m.shape[0] // MONTHS  # whole years available for windows
 
         # --- 1 + 2: training-frame windows, fixed vs batch stats -----------
         starts = list(range(0, Y - ctx - H + 1, args.window_stride_years))
         if starts:
             runs = {}
             if fitted:
-                runs["fixed"] = score_windows(jepa, y_ann, u_ann, ctx, H, starts, pooled=False)
+                runs["fixed"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=False)
             with batch_stats(jepa):
-                runs["batchB1"] = score_windows(jepa, y_ann, u_ann, ctx, H, starts, pooled=False)
-                runs["batchPooled"] = score_windows(jepa, y_ann, u_ann, ctx, H, starts, pooled=True)
+                runs["batchB1"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=False)
+                runs["batchPooled"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=True)
             main_key = "fixed" if fitted else "batchB1"
             for k, r in runs.items():
                 plot_lead(r, order, efold, f"{tag}_{k}", out_dir)
@@ -438,8 +449,8 @@ def main():
             print(f"[skip windows] {tr['name']}: {Y} yr < ctx+horizon {ctx + H}")
 
         # --- 3: long rollout -----------------------------------------------
-        lr = long_rollout(jepa, y_ann, u_ann, ctx)
-        u_np = u_ann.numpy()
+        lr = long_rollout(jepa, y_m, u_m, ctx)
+        u_np = lr["u_ann"]
         plot_long(lr, u_np, order, efold, bnorm, ctx, tag, out_dir)
         if jepa.gated_decay:
             plot_long(lr, u_np, order, efold, bnorm, ctx, tag, out_dir,

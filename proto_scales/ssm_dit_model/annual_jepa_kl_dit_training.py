@@ -21,7 +21,6 @@ from torch.utils.data import DataLoader
 import proto_scales.ssm_model.scales_ssm as scales_ssm
 from proto_scales.ssm_dit_model.annual_dit_training import LongHorizonWindowDataset, ModelEMA
 from proto_scales.ssm_dit_model.annual_jepa_kl_dit import AnnualJEPAKLOutpaintingDiT, ForcedAnnualJEPAKL
-from proto_scales.ssm_dit_model.annual_ssm import to_annual
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
 
 
@@ -35,14 +34,15 @@ def _load_scalers(run_dir):
 def z_stat_batches(dataset, encoder, device, batch_size=64):
     """
     Feed `ForcedAnnualJEPAKL.fit_z_stats` from a `LongHorizonWindowDataset`:
-    yields annual (y_ctx, u_ctx, y_full, u_full) per batch of windows.
+    yields encoder inputs (ye_ctx, ue_ctx, ye_full, ue_full) per batch of
+    windows — monthly or annual, whichever the latent process reads.
     """
+    jepa = encoder.ssm
     dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     for tas_c, pr_c, u_c, tas_f, pr_f, u_f, _ in dl:
-        tas_c, pr_c, u_c = tas_c.to(device), pr_c.to(device), u_c.to(device)
-        y_ctx, u_ctx, u_fut = encoder.annual_inputs(tas_c, pr_c, u_c, u_f.to(device))
-        y_fut = to_annual(torch.cat([tas_f, pr_f], dim=-1).to(device))
-        yield y_ctx, u_ctx, torch.cat([y_ctx, y_fut], 1), torch.cat([u_ctx, u_fut], 1)
+        ye_c, ue_c = jepa.encoder_inputs(torch.cat([tas_c, pr_c], dim=-1).to(device), u_c.to(device))
+        ye_f, ue_f = jepa.encoder_inputs(torch.cat([tas_f, pr_f], dim=-1).to(device), u_f.to(device))
+        yield ye_c, ue_c, torch.cat([ye_c, ye_f], 1), torch.cat([ue_c, ue_f], 1)
 
 
 def fit_z_stats(model, dataset, device, batch_size=64, verbose=True):
@@ -82,6 +82,7 @@ def run_train(
     normalize_z=True,
     gated_decay=False,
     gate_hidden=32,
+    monthly_encoder=False,
     jepa_weight=1.0,
     jepa_rollout_weight=1.0,
     jepa_kl_free_bits=0.05,
@@ -174,6 +175,7 @@ def run_train(
         trans_hidden=trans_hidden, decay_efold_range=decay_efold_range,
         target_decay=target_decay, normalize_z=normalize_z,
         gated_decay=gated_decay, gate_hidden=gate_hidden,
+        monthly_encoder=monthly_encoder,
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")
@@ -209,6 +211,8 @@ def run_train(
               f"{[round(v, 1) for v in jepa.efolding_years().tolist()]}")
         print(f"[model] per-dimension z standardization: "
               f"{'ON' if normalize_z else 'OFF (ablation)'}")
+        print(f"[model] encoder reads "
+              f"{'monthly input, z at each year end' if monthly_encoder else 'annual means'}")
         print(f"[model] decay: "
               f"{f'gated by (z_prev, u_t), gate_hidden={gate_hidden}' if gated_decay else 'linear (hard-clamped)'}")
         if raw_model.use_ssm_aux:
