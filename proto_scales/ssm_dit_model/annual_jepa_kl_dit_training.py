@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 import proto_scales.ssm_model.scales_ssm as scales_ssm
 from proto_scales.ssm_dit_model.annual_dit_training import LongHorizonWindowDataset, ModelEMA
 from proto_scales.ssm_dit_model.annual_jepa_kl_dit import AnnualJEPAKLOutpaintingDiT, ForcedAnnualJEPAKL
+from proto_scales.ssm_dit_model.annual_ssm import to_annual
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
 
 
@@ -29,6 +30,30 @@ def _load_scalers(run_dir):
     return (S.from_file(os.path.join(run_dir, "y_scaler.out")),
             S.from_file(os.path.join(run_dir, "pr_scaler.out")),
             S.from_file(os.path.join(run_dir, "u_scaler.out")))
+
+
+def z_stat_batches(dataset, encoder, device, batch_size=64):
+    """
+    Feed `ForcedAnnualJEPAKL.fit_z_stats` from a `LongHorizonWindowDataset`:
+    yields annual (y_ctx, u_ctx, y_full, u_full) per batch of windows.
+    """
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    for tas_c, pr_c, u_c, tas_f, pr_f, u_f, _ in dl:
+        tas_c, pr_c, u_c = tas_c.to(device), pr_c.to(device), u_c.to(device)
+        y_ctx, u_ctx, u_fut = encoder.annual_inputs(tas_c, pr_c, u_c, u_f.to(device))
+        y_fut = to_annual(torch.cat([tas_f, pr_f], dim=-1).to(device))
+        yield y_ctx, u_ctx, torch.cat([y_ctx, y_fut], 1), torch.cat([u_ctx, u_fut], 1)
+
+
+def fit_z_stats(model, dataset, device, batch_size=64, verbose=True):
+    """Fit the latent process's fixed z standardization on `dataset` (training windows)."""
+    enc = model.ssm_encoder
+    if not enc.ssm.normalize_z:
+        return
+    enc.ssm.fit_z_stats(z_stat_batches(dataset, enc, device, batch_size))
+    if verbose:
+        print(f"[z-stats] fitted on {len(dataset)} training windows | "
+              f"online std {[round(v, 3) for v in enc.ssm.z_std.tolist()]}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +248,10 @@ def run_train(
             if unexpected:
                 print(f"[dit]   unexpected (first 10): {unexpected[:10]}")
 
+    # Training uses batch stats; fixed stats from a previous fit would be stale
+    # (and EMA'd toward the unfitted defaults) once the encoder moves again.
+    raw_model.ssm_encoder.ssm.reset_z_stats()
+
     n_par = sum(p.numel() for p in raw_model.parameters())
     n_tr = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     if is_main:
@@ -369,6 +398,9 @@ def run_train(
 
     if best_state is not None:
         ema.shadow.load_state_dict(best_state)
+    # Fixed z stats for inference, fitted once with the final (sampling-EMA)
+    # encoder on the training windows. Every rank fits; only rank 0 saves.
+    fit_z_stats(ema.shadow, train_ds, device, verbose=is_main)
     if is_main:
         print(f"[done] best val {best_val:.4f}")
         print(f"[done] z e-folding times (yr): "

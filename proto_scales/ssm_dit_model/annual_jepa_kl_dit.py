@@ -257,6 +257,33 @@ class ForcedAnnualJEPAKL(nn.Module):
         # the rollout, since the ELBO's own prior variance isn't either.
         self.log_process_var = nn.Parameter(torch.zeros(z_dim))
 
+        # Fixed per-dimension standardization stats, fitted once on the
+        # training set after training (`fit_z_stats`), used in eval mode.
+        # Separate stats for the online encoder (fitted over context-length
+        # windows, the frame z_last is read in) and the target encoder (fitted
+        # over context+horizon windows, the frame the rollout loss targets).
+        # Until fitted, eval mode falls back to batch stats as before.
+        self.register_buffer("z_mean", torch.zeros(z_dim))
+        self.register_buffer("z_std", torch.ones(z_dim))
+        self.register_buffer("z_tgt_mean", torch.zeros(z_dim))
+        self.register_buffer("z_tgt_std", torch.ones(z_dim))
+        self.register_buffer("z_stats_fitted", torch.tensor(False))
+
+    _Z_STAT_BUFFERS = ("z_mean", "z_std", "z_tgt_mean", "z_tgt_std", "z_stats_fitted")
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Checkpoints from before the fixed stats existed: keep the defaults
+        # (unfitted -> batch stats) instead of failing a strict load.
+        for name in self._Z_STAT_BUFFERS:
+            state_dict.setdefault(prefix + name, getattr(self, name).clone())
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def reset_z_stats(self):
+        """Back to batch stats, e.g. before continuing training a fitted checkpoint."""
+        self.z_mean.zero_(); self.z_std.fill_(1.0)
+        self.z_tgt_mean.zero_(); self.z_tgt_std.fill_(1.0)
+        self.z_stats_fitted.fill_(False)
+
     # -----------------------
     # pieces
     # -----------------------
@@ -310,7 +337,7 @@ class ForcedAnnualJEPAKL(nn.Module):
             mu = mu + self.trans_mlp(torch.cat([z_prev, u_t], dim=-1))
         return mu
 
-    def _standardize(self, z):
+    def _standardize(self, z, target=False):
         """
         Per-dimension standardization, pooled over batch and time. Unlike
         `nn.LayerNorm(z_dim)` (which normalizes *across* dimensions at every
@@ -325,12 +352,63 @@ class ForcedAnnualJEPAKL(nn.Module):
 
         A no-op when `normalize_z=False` — gated here, in one place, rather
         than at each call site.
+
+        Training mode (and eval before `fit_z_stats` has run) uses the
+        batch's own stats. Those depend on which windows share the batch and
+        on the window length, so at inference — one trajectory, any context
+        length — they put z_last in a different frame from the one the
+        transition and DiT were trained on. Eval mode with fitted stats uses
+        the fixed training-set stats instead (BatchNorm-style).
         """
         if not self.normalize_z:
             return z
+        if not self.training and bool(self.z_stats_fitted):
+            mean, std = (self.z_tgt_mean, self.z_tgt_std) if target else (self.z_mean, self.z_std)
+            return (z - mean) / std
         mean = z.mean(dim=(0, 1), keepdim=True)
         std = z.std(dim=(0, 1), keepdim=True).clamp(min=1e-4)
         return (z - mean) / std
+
+    def _raw_online(self, y, u):
+        h, _ = self.gru(torch.cat([y, u], dim=-1))
+        return torch.chunk(self.q_head(h), 2, dim=-1)
+
+    @torch.no_grad()
+    def _raw_target(self, y, u):
+        h, _ = self.target_gru(torch.cat([y, u], dim=-1))
+        return torch.chunk(self.target_q_head(h), 2, dim=-1)[0]
+
+    @torch.no_grad()
+    def fit_z_stats(self, batches):
+        """
+        Fit the fixed standardization stats once, on the training set.
+        `batches` yields (y_ctx, u_ctx, y_full, u_full) in annual units:
+        context-length windows for the online stats, context+horizon windows
+        for the target stats (the frames each is read in during training).
+        Pooled over windows and time, per dimension.
+        """
+        acc = {k: [0.0, 0.0, 0] for k in ("on", "tgt")}
+
+        def add(key, z):
+            z = z.reshape(-1, self.z_dim).double()
+            a = acc[key]
+            a[0] = a[0] + z.sum(0); a[1] = a[1] + (z ** 2).sum(0); a[2] += z.shape[0]
+
+        for y_ctx, u_ctx, y_full, u_full in batches:
+            add("on", self._raw_online(y_ctx, u_ctx)[0])
+            add("tgt", self._raw_target(y_full, u_full))
+
+        def finish(key):
+            s, ss, n = acc[key]
+            if n < 2:
+                raise ValueError("fit_z_stats: no data")
+            mean = s / n
+            std = ((ss / n - mean ** 2) * n / (n - 1)).clamp(min=1e-8).sqrt().clamp(min=1e-4)
+            return mean.float(), std.float()
+
+        m, s = finish("on"); self.z_mean.copy_(m); self.z_std.copy_(s)
+        m, s = finish("tgt"); self.z_tgt_mean.copy_(m); self.z_tgt_std.copy_(s)
+        self.z_stats_fitted.fill_(True)
 
     def _encode_dist(self, y, u):
         """
@@ -338,8 +416,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         [B, T, z]. `mu` is standardized per dimension; `logvar` is left
         alone — it already has its own clamp.
         """
-        h, _ = self.gru(torch.cat([y, u], dim=-1))
-        mu, logvar = torch.chunk(self.q_head(h), 2, dim=-1)
+        mu, logvar = self._raw_online(y, u)
         return self._standardize(mu), torch.clamp(logvar, -12.0, 6.0)
 
     def encode(self, y, u):
@@ -356,9 +433,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         is not needed, same as `ForcedAnnualSSM`'s prior variance is a single
         learned parameter rather than something read off any encoder.
         """
-        h, _ = self.target_gru(torch.cat([y, u], dim=-1))
-        mu, _ = torch.chunk(self.target_q_head(h), 2, dim=-1)
-        return self._standardize(mu)
+        return self._standardize(self._raw_target(y, u), target=True)
 
     @torch.no_grad()
     def update_target_encoder(self):
