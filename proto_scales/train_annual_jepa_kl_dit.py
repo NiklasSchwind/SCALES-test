@@ -153,6 +153,13 @@ if __name__ == "__main__":
     p.add_argument("--jepa_cov_weight", type=float, default=1.0,
                    help="VICReg-style covariance penalty on the online encoding: guards against z-dimensions collapsing onto redundant copies of each other (different from magnitude collapse, which decay_efold_range's clamp and --weight_decay guard against)")
 
+    p.add_argument("--emission_weight", type=float, default=0.0,
+                   help="Annual emission y_ann = emit(z) (z only, no u), reconstruction of the context's annual means. Training loss only; the DiT still produces the field. > 0 for either emission weight adds the head")
+    p.add_argument("--emission_rollout_weight", type=float, default=0.0,
+                   help="Same emission applied to the forcing-only mean rollout over the horizon, against the future's annual means (ForcedAnnualSSM.rollout_loss, but the emission can't read u, so the forced response has to be carried by z)")
+    p.add_argument("--emission_hidden", type=int, default=0,
+                   help="0: linear emission head; > 0: one hidden layer of this width")
+
     # DiT
     p.add_argument("--context_len", type=int, default=120,
                    help="Context window in months; must be a whole number of years")
@@ -230,6 +237,9 @@ if __name__ == "__main__":
             jepa_rollout_weight=args.jepa_rollout_weight,
             jepa_kl_free_bits=args.jepa_kl_free_bits,
             jepa_cov_weight=args.jepa_cov_weight,
+            emission_weight=args.emission_weight,
+            emission_rollout_weight=args.emission_rollout_weight,
+            emission_hidden=args.emission_hidden,
             cond_dim=args.cond_dim, hidden=args.hidden, depth=args.depth,
             heads=args.heads, n_flow_steps=args.n_flow_steps,
             timescales_years=tuple(args.timescales),

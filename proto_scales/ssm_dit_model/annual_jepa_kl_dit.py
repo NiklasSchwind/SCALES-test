@@ -190,6 +190,17 @@ class ForcedAnnualJEPAKL(nn.Module):
                         `encoder_inputs(y_monthly, u_monthly)`; every method
                         that encodes takes those, and transition forcing is
                         passed separately in annual units.
+    annual_emission   : add an annual-mean emission head y_ann = emit(z), used
+                        only as a training loss (`emission_loss`), never at
+                        sampling, where the DiT still produces the field. It
+                        reads z only, not (z, u): with u as an input the
+                        forced response could again be carried by f(u)
+                        instead of by the dynamics, which is the shortcut
+                        this head exists to close. Its job is to make z hold
+                        the forced field state, slow modes included, rather
+                        than whatever representation is easiest to predict.
+    emission_hidden   : 0 -> linear emission; > 0 -> one hidden layer of that
+                        width.
     """
 
     def __init__(
@@ -205,6 +216,8 @@ class ForcedAnnualJEPAKL(nn.Module):
         gated_decay=False,
         gate_hidden=32,
         monthly_encoder=False,
+        annual_emission=False,
+        emission_hidden=0,
     ):
         super().__init__()
         lo, hi = decay_efold_range
@@ -275,6 +288,16 @@ class ForcedAnnualJEPAKL(nn.Module):
         # in `ForcedAnnualSSM` — not something recursively propagated through
         # the rollout, since the ELBO's own prior variance isn't either.
         self.log_process_var = nn.Parameter(torch.zeros(z_dim))
+
+        # Optional annual emission from z alone (training loss only). Only
+        # created when enabled, so checkpoints without it load unchanged.
+        self.annual_emission = bool(annual_emission)
+        if self.annual_emission:
+            self.emit = (
+                nn.Sequential(nn.Linear(z_dim, emission_hidden), nn.SiLU(),
+                              nn.Linear(emission_hidden, obs_dim))
+                if emission_hidden else nn.Linear(z_dim, obs_dim)
+            )
 
         # Fixed per-dimension standardization stats, fitted once on the
         # training set after training (`fit_z_stats`), used in eval mode.
@@ -571,6 +594,27 @@ class ForcedAnnualJEPAKL(nn.Module):
         )[:, z_ctx.shape[1]:]
         return ((z_traj - z_target_fut) ** 2).mean()
 
+    def emission_loss(self, ye_ctx, ue_ctx, y_ctx_ann, y_fut_ann, u_fut_ann):
+        """
+        Annual-mean emission terms, both through `emit(z)` (z only):
+
+          recon : the online encoding over the context reproduces the
+                  context's annual means.
+          roll  : the mean rollout from the end of the context, driven by
+                  forcing alone (exactly the trajectory the DiT is
+                  conditioned on), reproduces the future's annual means at
+                  every lead — `ForcedAnnualSSM.rollout_loss`, but with an
+                  emission that can't read u.
+
+        `y_*_ann` are annual means of the normalised field [B, Y, obs_dim].
+        Returns (recon, roll), per-element MSEs.
+        """
+        z_ctx = self.encode(ye_ctx, ue_ctx)
+        recon = ((self.emit(z_ctx) - y_ctx_ann) ** 2).mean()
+        z_traj = self.roll_forward(z_ctx[:, -1], u_fut_ann, stochastic=False)
+        roll = ((self.emit(z_traj) - y_fut_ann) ** 2).mean()
+        return recon, roll
+
     def z_covariance_loss(self, y, u):
         """
         VICReg-style covariance penalty on the online encoding's mean, pooled
@@ -616,7 +660,8 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
 
     def __init__(self, jepa, y_dim, u_dim, jepa_weight=1.0,
                  jepa_rollout_weight=1.0, jepa_kl_free_bits=0.05,
-                 jepa_cov_weight=1.0, **kwargs):
+                 jepa_cov_weight=1.0, emission_weight=0.0,
+                 emission_rollout_weight=0.0, **kwargs):
         super().__init__(
             ssm=jepa, y_dim=y_dim, u_dim=u_dim,
             ssm_elbo_weight=0.0, ssm_kl_weight=0.0, ssm_kl_free_bits=0.0,
@@ -626,9 +671,15 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
         self.jepa_rollout_weight = float(jepa_rollout_weight)
         self.jepa_kl_free_bits = float(jepa_kl_free_bits)
         self.jepa_cov_weight = float(jepa_cov_weight)
+        self.emission_weight = float(emission_weight)
+        self.emission_rollout_weight = float(emission_rollout_weight)
+        if (self.emission_weight > 0 or self.emission_rollout_weight > 0) \
+                and not jepa.annual_emission:
+            raise ValueError("emission weights > 0 need ForcedAnnualJEPAKL(annual_emission=True)")
         self.use_ssm_aux = (not self.ssm_encoder.frozen) and (
             self.jepa_weight > 0 or self.jepa_rollout_weight > 0
-            or self.jepa_cov_weight > 0)
+            or self.jepa_cov_weight > 0 or self.emission_weight > 0
+            or self.emission_rollout_weight > 0)
 
     def ssm_aux_loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut):
         """
@@ -665,6 +716,17 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
             total = total + self.jepa_cov_weight * cov
             parts["jepa_cov"] = cov.detach()
 
+        if self.emission_weight > 0 or self.emission_rollout_weight > 0:
+            recon, eroll = jepa.emission_loss(
+                ye_ctx, ue_ctx,
+                to_annual(torch.cat([tas_ctx, pr_ctx], dim=-1)),
+                to_annual(torch.cat([tas_fut, pr_fut], dim=-1)),
+                u_fut_ann)
+            total = total + self.emission_weight * recon \
+                + self.emission_rollout_weight * eroll
+            parts["emit_recon"] = recon.detach()
+            parts["emit_rollout"] = eroll.detach()
+
         return total, parts
 
 
@@ -686,6 +748,8 @@ def build_model(y_dim, u_dim, device="cpu", jepa_weights=None, **kwargs):
         gated_decay=kwargs.pop("gated_decay", False),
         gate_hidden=kwargs.pop("gate_hidden", 32),
         monthly_encoder=kwargs.pop("monthly_encoder", False),
+        annual_emission=kwargs.pop("annual_emission", False),
+        emission_hidden=kwargs.pop("emission_hidden", 0),
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")

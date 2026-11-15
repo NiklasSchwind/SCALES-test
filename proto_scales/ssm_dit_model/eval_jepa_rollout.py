@@ -46,6 +46,14 @@ Diagnostics, all in annual z space
    point 2 again). With --gated_decay, the gated e-folding time along the
    rollout and along the target trajectory is plotted too (`gated_tau_*.png`).
 
+4. Emission rollout (`emission_*.png`, runs with --emission_* weights only)
+   The annual emission emit(z) along the same long rollout, in physical
+   units, against the trajectory's annual means, for the regions given by
+   --emit_regions (default SOO). Compare with the DiT's forecast for the same
+   region: if the emission is right and the DiT is biased, the DiT is not
+   taking the forced response from z; if the emission is biased too, the
+   dynamics are.
+
 Everything is also saved to `<out_dir>/eval_jepa_rollout.npz`.
 """
 
@@ -172,6 +180,9 @@ def load_jepa(run_dir, weights, weights_key, cfg, y_dim, u_dim):
         gated_decay=cfg.get("gated_decay", False),
         monthly_encoder=cfg.get("monthly_encoder", False),
         gate_hidden=cfg.get("gate_hidden", 32),
+        annual_emission=(cfg.get("emission_weight", 0.0) > 0
+                         or cfg.get("emission_rollout_weight", 0.0) > 0),
+        emission_hidden=cfg.get("emission_hidden", 0),
     )
     path = weights or os.path.join(run_dir, "model_out")
     sd = torch.load(path, map_location="cpu")
@@ -280,6 +291,10 @@ def long_rollout(jepa, y_m, u_m, ctx):
     z_tgt_all = jepa.encode_target(*jepa.encoder_inputs(y, u))
     res = dict(z_roll=z_roll[0].numpy(), z_tgt=z_tgt_all[0, ctx:].numpy(),
                u_ann=u_ann[0].numpy())
+    if jepa.annual_emission:
+        # normalised units; converted to physical in main()
+        res["y_emit"] = jepa.emit(z_roll)[0].numpy()
+        res["y_ann"] = to_annual(y)[0, ctx:ctx + z_roll.shape[1]].numpy()
     if jepa.gated_decay:
         res["tau_roll"] = jepa.gated_efolding_years(z_last, u_ann[:, ctx:])[0].numpy()
         res["tau_tgt"] = torch.exp(jepa._log_tau(z_tgt_all[:, ctx - 1:-1], u_ann[:, ctx:]))[0].numpy()
@@ -300,6 +315,27 @@ def batch_stats(jepa):
 # ─────────────────────────────────────────────────────────────────────────────
 # plots
 # ─────────────────────────────────────────────────────────────────────────────
+def plot_emission(y_emit, y_ann, regions, sel, ctx, tag, out_dir):
+    """y_emit/y_ann [Y, 2R] physical annual means (tas then pr)."""
+    R = len(regions)
+    years = np.arange(ctx, ctx + y_emit.shape[0])
+    fig, axs = plt.subplots(2, len(sel), figsize=(4.5 * len(sel), 5.5),
+                            sharex=True, squeeze=False)
+    for j, name in enumerate(sel):
+        r = regions.index(name)
+        for i, (off, lab) in enumerate([(0, "tas [K]"), (R, "pr")]):
+            ax = axs[i, j]
+            ax.plot(years, y_ann[:, off + r], color="tab:red", lw=1, label="ESM")
+            ax.plot(years, y_emit[:, off + r], color="tab:blue", lw=1.2,
+                    label="emit(z rollout)")
+            ax.set_title(f"{name} {lab}", fontsize=9)
+    axs[0, 0].legend(fontsize=7)
+    fig.suptitle(f"{tag}: emit(z rollout)\nx = years after start", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"emission_{tag}.png"), dpi=120)
+    plt.close(fig)
+
+
 def plot_lead(res, order, efold, tag, out_dir):
     lead = np.arange(1, res["err_roll"].shape[1] + 1)
     fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))
@@ -375,6 +411,8 @@ def main():
                    help="default: horizon from config.txt (training rollout length)")
     p.add_argument("--window_stride_years", type=int, default=5)
     p.add_argument("--out_dir", default=None, help="default: <run_dir>/eval_rollout")
+    p.add_argument("--emit_regions", nargs="+", default=["SOO"],
+                   help="regions to plot the annual emission for (emission runs only)")
     args = p.parse_args()
 
     cfg = read_config(args.run_dir)
@@ -455,6 +493,24 @@ def main():
         if jepa.gated_decay:
             plot_long(lr, u_np, order, efold, bnorm, ctx, tag, out_dir,
                       key_a="tau_roll", key_b="tau_tgt", fname="gated_tau", ylab="tau")
+        if jepa.annual_emission:
+            R = y_dim
+            def phys(a):
+                return np.concatenate([
+                    tas_sc.inverse_transform(a[None, :, :R])[0],
+                    pr_sc.inverse_transform(a[None, :, R:])[0]], -1)
+            lr["y_emit"], lr["y_ann"] = phys(lr["y_emit"]), phys(lr["y_ann"])
+            sel = [r for r in args.emit_regions if r in regions]
+            missing = sorted(set(args.emit_regions) - set(sel))
+            if missing and i == 0:
+                print(f"[warn] --emit_regions not found: {missing}; available: {regions}")
+            if sel:
+                plot_emission(lr["y_emit"], lr["y_ann"], regions, sel, ctx, tag, out_dir)
+            if rows and rows[-1]["traj"] == tr["name"]:
+                err = (lr["y_emit"] - lr["y_ann"])[:, :R]
+                rows[-1]["emit_tas_bias_last100"] = float(err[-100:].mean())
+                for r in sel:
+                    rows[-1][f"emit_{r}_bias_last100"] = float(err[-100:, regions.index(r)].mean())
         for k, v in lr.items():
             saved[f"{tag}/long/{k}"] = v
 

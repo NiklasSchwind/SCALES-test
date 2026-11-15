@@ -87,6 +87,9 @@ def run_train(
     jepa_rollout_weight=1.0,
     jepa_kl_free_bits=0.05,
     jepa_cov_weight=1.0,
+    emission_weight=0.0,
+    emission_rollout_weight=0.0,
+    emission_hidden=0,
     # DiT
     cond_dim=256,
     hidden=384,
@@ -176,6 +179,8 @@ def run_train(
         target_decay=target_decay, normalize_z=normalize_z,
         gated_decay=gated_decay, gate_hidden=gate_hidden,
         monthly_encoder=monthly_encoder,
+        annual_emission=(emission_weight > 0 or emission_rollout_weight > 0),
+        emission_hidden=emission_hidden,
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")
@@ -198,6 +203,8 @@ def run_train(
         jepa_rollout_weight=jepa_rollout_weight,
         jepa_kl_free_bits=jepa_kl_free_bits,
         jepa_cov_weight=jepa_cov_weight,
+        emission_weight=emission_weight,
+        emission_rollout_weight=emission_rollout_weight,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -220,6 +227,10 @@ def run_train(
                   f"rollout_weight={jepa_rollout_weight}, "
                   f"kl_free_bits={jepa_kl_free_bits}, cov_weight={jepa_cov_weight}, "
                   f"target_decay={target_decay})")
+        if jepa.annual_emission:
+            print(f"[model] annual emission from z only "
+                  f"({'linear' if not emission_hidden else f'hidden {emission_hidden}'}): "
+                  f"recon weight {emission_weight}, rollout weight {emission_rollout_weight}")
         elif not freeze_jepa:
             print("[model] WARNING: JEPA-KL latent process is trainable but has no "
                   "auxiliary objective. z is shaped by the flow-matching loss "
@@ -380,7 +391,7 @@ def run_train(
             raise RuntimeError(
                 f"epoch {epoch}: every step was skipped as non-finite. The model "
                 f"has diverged; lower --lr, --jepa_weight, --jepa_rollout_weight, "
-                f"--jepa_kl_free_bits or --jepa_cov_weight.")
+                f"--jepa_kl_free_bits, --jepa_cov_weight or the emission weights.")
         tr_mean = float(np.mean(tr_losses))
         va_mean = float(np.mean(va_losses)) if va_losses else float("nan")
         if is_main:
