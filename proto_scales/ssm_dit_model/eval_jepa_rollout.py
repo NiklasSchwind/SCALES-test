@@ -54,6 +54,18 @@ Diagnostics, all in annual z space
    taking the forced response from z; if the emission is biased too, the
    dynamics are.
 
+5. Restarts (`restarts_*.png`, with --restart_years)
+   Is the state the rollout carries through the decades the state the encoder
+   reads? For each restart year the online encoder reads the *whole* history
+   from the trajectory start up to that year (as the forecasts do), then
+   rolls out on forcing alone to the end. The z trajectories from all
+   restarts are overlaid with the target encoding. Printed per dim (sorted by
+   e-folding time): the gap between the rollout from the first restart and
+   the encoder's read at each later restart year — a consistent state model
+   has gaps near zero; a gap that grows with time on the slow dims means the
+   rollout reaches the later year in a different state than the data say.
+   With an emission head, the same for emit(z) in the --emit_regions.
+
 Everything is also saved to `<out_dir>/eval_jepa_rollout.npz`.
 """
 
@@ -301,6 +313,35 @@ def long_rollout(jepa, y_m, u_m, ctx):
     return res
 
 
+@torch.no_grad()
+def restart_rollouts(jepa, y_m, u_m, restarts):
+    """
+    `restarts`: years since trajectory start (each >= 2). For each r: encode
+    the whole history [0, r) (monthly or annual per the encoder mode), roll
+    out on annual forcing over [r, end). Returns {r: z_roll [Y_end - r, z]},
+    {r: z_last [z]} (the encoder's read of year r-1).
+    """
+    y, u = y_m[None], u_m[None]
+    u_ann = to_annual(u)
+    rolls, lasts = {}, {}
+    for r in restarts:
+        M = r * MONTHS
+        _, z_last = jepa.posterior(*jepa.encoder_inputs(y[:, :M], u[:, :M]))
+        rolls[r] = jepa.roll_forward(z_last, u_ann[:, r:])[0].numpy()
+        lasts[r] = z_last[0].numpy()
+    return rolls, lasts
+
+
+def restart_gaps(rolls, lasts, restarts):
+    """
+    Gap at each later restart r_k between the rollout from the first restart
+    r_0 and the encoder's read there: z_roll_0[year r_k - 1] - z_last(r_k).
+    Returns [len(restarts) - 1, z].
+    """
+    r0 = restarts[0]
+    return np.stack([rolls[r0][rk - 1 - r0] - lasts[rk] for rk in restarts[1:]])
+
+
 @contextmanager
 def batch_stats(jepa):
     """Temporarily standardize with batch stats, as before `fit_z_stats`."""
@@ -333,6 +374,54 @@ def plot_emission(y_emit, y_ann, regions, sel, ctx, tag, out_dir):
     fig.suptitle(f"{tag}: emit(z rollout)\nx = years after start", fontsize=9)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f"emission_{tag}.png"), dpi=120)
+    plt.close(fig)
+
+
+def plot_restarts(rolls, z_tgt, restarts, order, efold, gain, year0, tag, out_dir):
+    """z_tgt [Y, z] target encoding over the whole trajectory."""
+    n = len(order)
+    ncol = 4
+    nrow = int(np.ceil(n / ncol))
+    fig, axs = plt.subplots(nrow, ncol, figsize=(4 * ncol, 2.3 * nrow), sharex=True)
+    axs = axs.ravel()
+    years = year0 + np.arange(z_tgt.shape[0])
+    cmap = plt.get_cmap("viridis")
+    for j, d in enumerate(order):
+        ax = axs[j]
+        ax.plot(years, z_tgt[:, d], color="tab:red", lw=0.8, label="target enc")
+        for k, r in enumerate(restarts):
+            c = cmap(k / max(1, len(restarts) - 1))
+            yr = year0 + r + np.arange(rolls[r].shape[0])
+            ax.plot(yr, rolls[r][:, d], color=c, lw=1.2, label=f"from {year0 + r}")
+            ax.axvline(year0 + r, color=c, lw=0.5, ls=":")
+        ax.set_title(f"d{d} | τ={efold[d]:.1f}y | gain={gain[d]:.2f}", fontsize=8)
+    for k in range(n, len(axs)):
+        axs[k].axis("off")
+    axs[0].legend(fontsize=6)
+    fig.suptitle(f"{tag}: rollouts restarted from the encoder's read of the full history",
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"restarts_{tag}.png"), dpi=120)
+    plt.close(fig)
+
+
+def plot_restarts_emission(e_rolls, y_ann, restarts, regions, sel, year0, tag, out_dir):
+    """e_rolls {r: [Y - r, 2R]}, y_ann [Y, 2R], physical units; tas only."""
+    fig, axs = plt.subplots(1, len(sel), figsize=(5 * len(sel), 3.5), squeeze=False)
+    years = year0 + np.arange(y_ann.shape[0])
+    cmap = plt.get_cmap("viridis")
+    for j, name in enumerate(sel):
+        ri = regions.index(name)
+        ax = axs[0, j]
+        ax.plot(years, y_ann[:, ri], color="tab:red", lw=0.8, label="ESM")
+        for k, r in enumerate(restarts):
+            ax.plot(year0 + r + np.arange(e_rolls[r].shape[0]), e_rolls[r][:, ri],
+                    color=cmap(k / max(1, len(restarts) - 1)), lw=1.2,
+                    label=f"from {year0 + r}")
+        ax.set_title(f"{name} tas [K], emit(z rollout)", fontsize=9)
+    axs[0, 0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"restarts_emission_{tag}.png"), dpi=120)
     plt.close(fig)
 
 
@@ -411,6 +500,11 @@ def main():
                    help="default: horizon from config.txt (training rollout length)")
     p.add_argument("--window_stride_years", type=int, default=5)
     p.add_argument("--out_dir", default=None, help="default: <run_dir>/eval_rollout")
+    p.add_argument("--restart_years", nargs="+", type=int, default=None,
+                   help="calendar years to restart the rollout from, each using the whole "
+                        "history before it as context, e.g. 1860 1950 2010 (see 5. above)")
+    p.add_argument("--traj_start_year", type=int, default=1850,
+                   help="calendar year of the first month of each trajectory")
     p.add_argument("--emit_regions", nargs="+", default=["SOO"],
                    help="regions to plot the annual emission for (emission runs only)")
     args = p.parse_args()
@@ -439,6 +533,10 @@ def main():
 
     efold = jepa.efolding_years().numpy()
     bnorm = jepa.B.weight.detach().norm(dim=1).numpy()
+    # long-run response of each dim to constant forcing, ||B_row|| / (1 - d)
+    # with the baseline decay (gate off)
+    with torch.no_grad():
+        gain = bnorm / (1.0 - jepa.decay().numpy())
     order = np.argsort(efold)
     print(f"[model] ctx {ctx} yr | horizon {H} yr | gated_decay {jepa.gated_decay} | "
           f"monthly_encoder {jepa.monthly_encoder} | "
@@ -514,6 +612,42 @@ def main():
         for k, v in lr.items():
             saved[f"{tag}/long/{k}"] = v
 
+        # --- 5: restarts ---------------------------------------------------
+        if args.restart_years:
+            rs = sorted({yr - args.traj_start_year for yr in args.restart_years})
+            rs = [r for r in rs if 2 <= r < Y]
+            if len(rs) < len(set(args.restart_years)):
+                print(f"[restarts] {tr['name']}: kept {[args.traj_start_year + r for r in rs]} "
+                      f"(trajectory {args.traj_start_year}-{args.traj_start_year + Y - 1})")
+            if rs:
+                rolls, lasts = restart_rollouts(jepa, y_m, u_m, rs)
+                with torch.no_grad():
+                    z_tgt_full = jepa.encode_target(*jepa.encoder_inputs(y_m[None], u_m[None]))[0].numpy()
+                plot_restarts(rolls, z_tgt_full, rs, order, efold, gain,
+                              args.traj_start_year, tag, out_dir)
+                for r in rs:
+                    saved[f"{tag}/restart/{args.traj_start_year + r}/z_roll"] = rolls[r]
+                    saved[f"{tag}/restart/{args.traj_start_year + r}/z_last"] = lasts[r]
+                if len(rs) > 1:
+                    gaps = restart_gaps(rolls, lasts, rs)
+                    saved[f"{tag}/restart/gaps"] = gaps
+                    y0 = args.traj_start_year
+                    print(f"\n[restarts] {tr['name']}: z_roll(from {y0 + rs[0]}) - "
+                          f"z_encoder(read at year), per dim")
+                    print("   dim   efold    gain  " + "".join(f"{y0 + r:>9d}" for r in rs[1:]))
+                    for d in order:
+                        print(f"   d{d:<3d}{efold[d]:7.1f} {gain[d]:7.3f}  "
+                              + "".join(f"{g:9.3f}" for g in gaps[:, d]))
+                if jepa.annual_emission:
+                    sel = [r for r in args.emit_regions if r in regions]
+                    if sel:
+                        with torch.no_grad():
+                            e_rolls = {r: phys(jepa.emit(torch.tensor(rolls[r])).numpy())
+                                       for r in rs}
+                        y_ann_full = phys(to_annual(y_m[None])[0].numpy())
+                        plot_restarts_emission(e_rolls, y_ann_full, rs, regions, sel,
+                                               args.traj_start_year, tag, out_dir)
+
     if rows:
         df = pd.DataFrame(rows)
         with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
@@ -523,9 +657,9 @@ def main():
             print(df.to_string(index=False))
         df.to_csv(os.path.join(out_dir, "summary.csv"), index=False)
 
-    print("\nper-dim (sorted by e-folding): efold [yr] | ||B_row||")
+    print("\nper-dim (sorted by e-folding): efold [yr] | ||B_row|| | long-run gain ||B||/(1-d)")
     for d in order:
-        print(f"  d{d:2d}  {efold[d]:7.1f}  {bnorm[d]:.4f}")
+        print(f"  d{d:2d}  {efold[d]:7.1f}  {bnorm[d]:.4f}  {gain[d]:.3f}")
     np.savez_compressed(os.path.join(out_dir, "eval_jepa_rollout.npz"), **saved)
     print(f"\nwrote plots + summary.csv + eval_jepa_rollout.npz to {out_dir}")
 

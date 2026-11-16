@@ -98,7 +98,10 @@ allowed to claim around it.
 """
 
 import copy
+import glob
 import math
+import os
+import re
 
 import torch
 import torch.nn as nn
@@ -761,3 +764,123 @@ def build_model(y_dim, u_dim, device="cpu", jepa_weights=None, **kwargs):
 
     model = AnnualJEPAKLOutpaintingDiT(jepa=jepa, y_dim=y_dim, u_dim=u_dim, **kwargs)
     return model.to(device)
+
+
+_CKPT_EPOCH_RE = re.compile(r"annual_jepa_kl_dit_epoch(\d+)\.pt$")
+_EMIT_PREFIX = "ssm_encoder.ssm.emit."
+
+
+def emission_kwargs_from_state_dict(state_dict):
+    """
+    `annual_emission` / `emission_hidden` as stored in a state dict: the head
+    exists only in runs trained with an emission weight > 0, and its shape
+    gives the hidden width (`emit.0.weight` [hidden, z]) or says it is
+    linear (`emit.weight`).
+    """
+    if not any(k.startswith(_EMIT_PREFIX) for k in state_dict):
+        return dict(annual_emission=False, emission_hidden=0)
+    w0 = state_dict.get(_EMIT_PREFIX + "0.weight")
+    return dict(annual_emission=True,
+                emission_hidden=0 if w0 is None else int(w0.shape[0]))
+
+
+def load_jepa_dit_annual(run_dir, y_dim, u_dim=1, device="gpu", ema=True,
+                         checkpoint=None, prefer_zstats=True, **model_kwargs):
+    """
+    Load a trained `AnnualJEPAKLOutpaintingDiT` plus its tas/pr/u scalers from
+    a `train_annual_jepa_kl_dit.py` run directory.
+
+    Which weights
+    -------------
+    `checkpoint=None` or `"latest"`: the highest epoch in
+    `run_dir/checkpoints/` if there are any, else `run_dir/model_out`
+    (note: the reverse of `eval_jepa_rollout`'s default, kept from the
+    original loader). `checkpoint="model_out"` or an epoch number picks one
+    explicitly. Epoch checkpoints hold
+    `{"model": ..., "ema": ...}` and `ema` picks which; `model_out` is
+    already the best-validation EMA shadow, so `ema=False` raises there.
+    With `prefer_zstats`, a `*_zstats` copy written by
+    `proto_scales.fit_jepa_kl_z_stats` is used instead of the original when it
+    exists (epoch checkpoints are saved before the end-of-training z-stat
+    fit; `model_out` already has fitted stats).
+
+    Architecture
+    ------------
+    `model_kwargs` go to `build_model` and must match the run (`config.txt`).
+    `annual_emission` / `emission_hidden` are read from the weights unless
+    given explicitly, so emission and non-emission runs load the same way.
+
+    `device="gpu"` -> "cuda" (CPU fallback with a warning). Returns
+    (model, tas_scaler, pr_scaler, u_scaler), model in eval() mode — needed for
+    the fixed z stats to be used.
+    """
+    from proto_scales.ssm_model.scales_ssm import StandardScaler
+
+    if device in ("gpu", "cuda"):
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            print("[load_jepa_dit_annual] no GPU visible, falling back to CPU")
+            device = "cpu"
+
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    epochs = {}
+    for f in glob.glob(os.path.join(ckpt_dir, "annual_jepa_kl_dit_epoch*.pt")):
+        m = _CKPT_EPOCH_RE.search(f)   # skips the *_zstats.pt copies
+        if m:
+            epochs[int(m.group(1))] = f
+    model_out = os.path.join(run_dir, "model_out")
+
+    if checkpoint is None or checkpoint == "latest":
+        if checkpoint == "latest" and not epochs:
+            raise FileNotFoundError(f"no epoch checkpoints in {ckpt_dir}")
+        checkpoint = max(epochs) if epochs else "model_out"
+    if checkpoint == "model_out":
+        if not ema:
+            raise ValueError(
+                f"{model_out} is already the EMA shadow, so ema=False cannot be "
+                f"satisfied; pick an epoch checkpoint (--ckpt_every) for raw weights.")
+        if not os.path.exists(model_out):
+            raise FileNotFoundError(
+                f"{model_out} doesn't exist (training not finished?) and there are "
+                f"no epoch checkpoints in {ckpt_dir}")
+        path = model_out
+    else:
+        if int(checkpoint) not in epochs:
+            raise FileNotFoundError(
+                f"no epoch {checkpoint} in {ckpt_dir}; available: {sorted(epochs)}")
+        path = epochs[int(checkpoint)]
+    if prefer_zstats:
+        root, ext = os.path.splitext(path)
+        zs = f"{root}_zstats{ext}"
+        if os.path.exists(zs):
+            path = zs
+
+    ckpt = torch.load(path, map_location="cpu")
+    if isinstance(ckpt, dict) and ("model" in ckpt or "ema" in ckpt):
+        state_dict = ckpt["ema" if ema else "model"]
+        which = "ema" if ema else "model"
+    else:
+        state_dict, which = ckpt, "ema"
+    print(f"[load_jepa_dit_annual] loaded {which} weights from {path}")
+
+    for k, v in emission_kwargs_from_state_dict(state_dict).items():
+        model_kwargs.setdefault(k, v)
+    if model_kwargs["annual_emission"]:
+        h = model_kwargs["emission_hidden"]
+        print(f"[load_jepa_dit_annual] annual emission head "
+              f"({'linear' if not h else f'hidden {h}'})")
+
+    model = build_model(y_dim, u_dim, device=device, **model_kwargs)
+    model.load_state_dict(state_dict)
+    model.eval()
+    if model.ssm_encoder.ssm.normalize_z and not bool(model.ssm_encoder.ssm.z_stats_fitted):
+        opt = "" if checkpoint == "model_out" else f" --checkpoint {checkpoint}"
+        print("[load_jepa_dit_annual] WARNING: no fitted z stats in these weights -> "
+              "batch-stat standardization. Run python -m proto_scales.fit_jepa_kl_z_stats "
+              f"--run_dir {run_dir}{opt}")
+
+    tas_scaler = StandardScaler.from_file(os.path.join(run_dir, "y_scaler.out"))
+    pr_scaler = StandardScaler.from_file(os.path.join(run_dir, "pr_scaler.out"))
+    u_scaler = StandardScaler.from_file(os.path.join(run_dir, "u_scaler.out"))
+    return model, tas_scaler, pr_scaler, u_scaler
