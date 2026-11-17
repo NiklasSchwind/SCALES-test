@@ -193,6 +193,23 @@ class ForcedAnnualJEPAKL(nn.Module):
                         `encoder_inputs(y_monthly, u_monthly)`; every method
                         that encodes takes those, and transition forcing is
                         passed separately in annual units.
+    enc_window_years  : 0 (default) -> both GRUs run over the whole window
+                        from h0 = 0, so z_t depends on how long the GRU has
+                        been running (its "age"), not only on recent field.
+                        Training only ever reads the online encoder at ages
+                        <= context + horizon and z_last at age = context; a
+                        slow z-dim can lock onto age, become a lead-time
+                        clock in the rollout target, and go out of range
+                        beyond the training horizon. > 0 -> every year is
+                        read from a fixed lookback of this many years (a
+                        fresh GRU run over just those months), so z_t is a
+                        function of (y, u) over [t - L, t] only, identical at
+                        every position and in every window. Years with less
+                        history than L (the first L-1 of a window) keep the
+                        prefix read. Stored as a buffer, so a checkpoint
+                        carries its own setting (old checkpoints load as 0).
+                        Should not exceed the context, else z_last is a
+                        shorter read than the targets.
     annual_emission   : add an annual-mean emission head y_ann = emit(z), used
                         only as a training loss (`emission_loss`), never at
                         sampling, where the DiT still produces the field. It
@@ -221,6 +238,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         monthly_encoder=False,
         annual_emission=False,
         emission_hidden=0,
+        enc_window_years=0,
     ):
         super().__init__()
         lo, hi = decay_efold_range
@@ -313,6 +331,7 @@ class ForcedAnnualJEPAKL(nn.Module):
         self.register_buffer("z_tgt_mean", torch.zeros(z_dim))
         self.register_buffer("z_tgt_std", torch.ones(z_dim))
         self.register_buffer("z_stats_fitted", torch.tensor(False))
+        self.register_buffer("enc_window_years", torch.tensor(int(enc_window_years)))
 
     _Z_STAT_BUFFERS = ("z_mean", "z_std", "z_tgt_mean", "z_tgt_std", "z_stats_fitted")
 
@@ -321,6 +340,8 @@ class ForcedAnnualJEPAKL(nn.Module):
         # (unfitted -> batch stats) instead of failing a strict load.
         for name in self._Z_STAT_BUFFERS:
             state_dict.setdefault(prefix + name, getattr(self, name).clone())
+        # Checkpoints from before the fixed-lookback option: whole-window reads.
+        state_dict.setdefault(prefix + "enc_window_years", torch.tensor(0))
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def reset_z_stats(self):
@@ -426,15 +447,31 @@ class ForcedAnnualJEPAKL(nn.Module):
         return to_annual(y_monthly), to_annual(u_monthly)
 
     def _run_gru(self, gru, ye, ue):
-        """[B, T_enc, h] -> [B, Y, h]: one state per year (year end if monthly)."""
-        h, _ = gru(torch.cat([ye, ue], dim=-1))
-        if self.monthly_encoder:
-            T = h.shape[1]
-            # December of each year; a trailing partial year reads its last month,
-            # matching `to_annual`'s partial-year mean.
-            idx = torch.arange(11, T + 11, 12, device=h.device).clamp(max=T - 1)
-            h = h[:, idx]
-        return h
+        """
+        [B, T_enc, .] -> [B, Y, h]: one state per year (year end if monthly).
+        With `enc_window_years` > 0, each year with a full lookback behind it
+        is read by a separate GRU run over just that lookback (see the class
+        docstring); the windows are batched, so this is one GRU call of
+        length L instead of one of length T.
+        """
+        x = torch.cat([ye, ue], dim=-1)
+        T = x.shape[1]
+        step = 12 if self.monthly_encoder else 1
+        # December of each year; a trailing partial year reads its last month,
+        # matching `to_annual`'s partial-year mean.
+        idx = torch.arange(step - 1, T + step - 1, step, device=x.device).clamp(max=T - 1)
+        L = int(self.enc_window_years) * step
+        if L <= 0 or T <= L:
+            h, _ = gru(x)
+            return h[:, idx] if self.monthly_encoder else h
+        full = idx >= L - 1
+        h_pre, _ = gru(x[:, :L])                      # prefix reads, first years
+        ends = idx[full]
+        win = x.unfold(1, L, 1)[:, ends - L + 1]      # [B, nW, F, L]
+        Bsz, nW, F, _ = win.shape
+        hw, _ = gru(win.permute(0, 1, 3, 2).reshape(Bsz * nW, L, F))
+        hw = hw[:, -1].reshape(Bsz, nW, -1)
+        return torch.cat([h_pre[:, idx[~full]], hw], dim=1)
 
     def _raw_online(self, ye, ue):
         return torch.chunk(self.q_head(self._run_gru(self.gru, ye, ue)), 2, dim=-1)
@@ -753,6 +790,7 @@ def build_model(y_dim, u_dim, device="cpu", jepa_weights=None, **kwargs):
         monthly_encoder=kwargs.pop("monthly_encoder", False),
         annual_emission=kwargs.pop("annual_emission", False),
         emission_hidden=kwargs.pop("emission_hidden", 0),
+        enc_window_years=kwargs.pop("enc_window_years", 0),
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")

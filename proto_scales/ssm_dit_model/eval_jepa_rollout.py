@@ -195,6 +195,7 @@ def load_jepa(run_dir, weights, weights_key, cfg, y_dim, u_dim):
         annual_emission=(cfg.get("emission_weight", 0.0) > 0
                          or cfg.get("emission_rollout_weight", 0.0) > 0),
         emission_hidden=cfg.get("emission_hidden", 0),
+        enc_window_years=cfg.get("enc_window_years", 0),
     )
     path = weights or os.path.join(run_dir, "model_out")
     sd = torch.load(path, map_location="cpu")

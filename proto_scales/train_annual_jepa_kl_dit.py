@@ -138,6 +138,8 @@ if __name__ == "__main__":
                    help="State-dependent timescales: tau_t = tau(z_t-1, u_t), smoothly bounded to --decay_efold in log-timescale space, so slow modes can respond differently to warming and cooling while staying contractive. Gate is zero-initialised, so training starts from the linear model. Not compatible with warm-starting from a linear-mode checkpoint")
     p.add_argument("--monthly_encoder", action="store_true",
                    help="Run the encoder GRUs over monthly input and read z at each year end, instead of over annual means. Transition/rollout stay annual. A 10-yr context is then 120 GRU steps instead of 10, longer than the encoder's warm-up transient from h0=0. Not checkpoint-compatible with annual-encoder runs in the sense that the GRU learned different input statistics")
+    p.add_argument("--enc_window_years", type=int, default=0,
+                   help="0: encoder GRUs read the whole window from h0=0, so z can depend on how long the GRU has run (a lead-time clock). > 0: each year is encoded from a fixed lookback of this many years only, identical at every position. Must not exceed --context_len in years; 10 with the default context")
     p.add_argument("--gate_hidden", type=int, default=32,
                    help="Hidden width of the --gated_decay gate MLP")
     p.add_argument("--target_decay", type=float, default=0.996,
@@ -240,6 +242,7 @@ if __name__ == "__main__":
             emission_weight=args.emission_weight,
             emission_rollout_weight=args.emission_rollout_weight,
             emission_hidden=args.emission_hidden,
+            enc_window_years=args.enc_window_years,
             cond_dim=args.cond_dim, hidden=args.hidden, depth=args.depth,
             heads=args.heads, n_flow_steps=args.n_flow_steps,
             timescales_years=tuple(args.timescales),

@@ -90,6 +90,7 @@ def run_train(
     emission_weight=0.0,
     emission_rollout_weight=0.0,
     emission_hidden=0,
+    enc_window_years=0,
     # DiT
     cond_dim=256,
     hidden=384,
@@ -157,6 +158,12 @@ def run_train(
     pr_n = pr_scaler.transform(pr_np)
     u_n = u_scaler.transform(u_np)
 
+    if enc_window_years > 0 and enc_window_years * MONTHS_PER_YEAR > context_len:
+        raise ValueError(
+            f"enc_window_years={enc_window_years} exceeds the context "
+            f"({context_len / MONTHS_PER_YEAR:.0f} yr): z_last would be a shorter "
+            f"read than the rollout targets")
+
     # ---- data --------------------------------------------------------------
     ds_kw = dict(context_len=context_len, horizon=horizon, stride=stride,
                  data_start_month=data_start_month)
@@ -181,6 +188,7 @@ def run_train(
         monthly_encoder=monthly_encoder,
         annual_emission=(emission_weight > 0 or emission_rollout_weight > 0),
         emission_hidden=emission_hidden,
+        enc_window_years=enc_window_years,
     )
     if jepa_weights is not None:
         ckpt = torch.load(jepa_weights, map_location="cpu")
@@ -220,6 +228,8 @@ def run_train(
               f"{'ON' if normalize_z else 'OFF (ablation)'}")
         print(f"[model] encoder reads "
               f"{'monthly input, z at each year end' if monthly_encoder else 'annual means'}")
+        print(f"[model] encoder lookback: "
+              f"{f'fixed {enc_window_years} yr per year' if enc_window_years > 0 else 'whole window from h0=0'}")
         print(f"[model] decay: "
               f"{f'gated by (z_prev, u_t), gate_hidden={gate_hidden}' if gated_decay else 'linear (hard-clamped)'}")
         if raw_model.use_ssm_aux:
