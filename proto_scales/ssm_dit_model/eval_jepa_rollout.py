@@ -115,7 +115,7 @@ def read_config(run_dir):
     return cfg
 
 
-CKPT_RE = re.compile(r"annual_jepa_kl_dit_epoch(\d+)\.pt$")
+CKPT_RE = re.compile(r"annual_(?:jepa_kl|elbo)_dit_epoch(\d+)\.pt$")
 
 
 def zstats_path(path):
@@ -180,30 +180,71 @@ def resolve_weights(run_dir, weights=None, checkpoint=None, prefer_zstats=True):
     return path, tag
 
 
+def is_elbo(m):
+    """`annual_elbo_dit.ForcedAnnualELBO` (vs `ForcedAnnualJEPAKL`)."""
+    return hasattr(m, "emit_mean")
+
+
+def ref_encode(m, ye, ue):
+    """Reference read of the real field: target encoder (JEPA), posterior mean (ELBO)."""
+    return m.posterior(ye, ue)[0] if is_elbo(m) else m.encode_target(ye, ue)
+
+
+def has_emission(m):
+    return is_elbo(m) or bool(getattr(m, "annual_emission", False))
+
+
+def emit_ann(m, z, u_ann):
+    """
+    Annual emission [..., 2R] in normalised units. ELBO: pattern scaling(u) +
+    residual(z), tas only, pr filled with NaN so the plots/units code is shared.
+    """
+    if is_elbo(m):
+        tas = m.emit_mean(z, u_ann)
+        return torch.cat([tas, torch.full_like(tas, float("nan"))], dim=-1)
+    return m.emit(z)
+
+
+def uses_z_stats(m):
+    return bool(getattr(m, "normalize_z", False))
+
+
 def load_jepa(run_dir, weights, weights_key, cfg, y_dim, u_dim):
-    jepa = ForcedAnnualJEPAKL(
-        obs_dim=2 * y_dim, u_dim=u_dim,
-        z_dim=cfg.get("z_dim", 16),
-        rnn_hidden=cfg.get("rnn_hidden", 64),
-        trans_hidden=cfg.get("trans_hidden", 0),
-        decay_efold_range=tuple(cfg.get("decay_efold", (1.0, 50.0))),
-        target_decay=cfg.get("target_decay", 0.996),
-        normalize_z=cfg.get("normalize_z", True),
-        gated_decay=cfg.get("gated_decay", False),
-        monthly_encoder=cfg.get("monthly_encoder", False),
-        gate_hidden=cfg.get("gate_hidden", 32),
-        annual_emission=(cfg.get("emission_weight", 0.0) > 0
-                         or cfg.get("emission_rollout_weight", 0.0) > 0),
-        emission_hidden=cfg.get("emission_hidden", 0),
-        enc_window_years=cfg.get("enc_window_years", 0),
-    )
+    """
+    The latent process alone (`ForcedAnnualJEPAKL`, or `ForcedAnnualELBO` when
+    the weights carry the frozen pattern scaling `ps_weight`), in eval mode.
+    """
     path = weights or os.path.join(run_dir, "model_out")
     sd = torch.load(path, map_location="cpu")
     if isinstance(sd, dict) and ("model" in sd or "ema" in sd):
         sd = sd[weights_key]
-        src = f"{path} ['{weights_key}']"
+    if "ssm_encoder.ssm.ps_weight" in sd:
+        from proto_scales.ssm_dit_model.annual_elbo_dit import (
+            ForcedAnnualELBO, ssm_kwargs_from_state_dict)
+        jepa = ForcedAnnualELBO(
+            y_dim=y_dim, u_dim=u_dim,
+            decay_efold_range=tuple(cfg.get("decay_efold", (1.0, 50.0))),
+            monthly_encoder=cfg.get("monthly_encoder", True),
+            **ssm_kwargs_from_state_dict(sd, y_dim, u_dim))
+        print("[model] ELBO latent process (annual_elbo_dit)")
     else:
-        src = path
+        jepa = ForcedAnnualJEPAKL(
+            obs_dim=2 * y_dim, u_dim=u_dim,
+            z_dim=cfg.get("z_dim", 16),
+            rnn_hidden=cfg.get("rnn_hidden", 64),
+            trans_hidden=cfg.get("trans_hidden", 0),
+            decay_efold_range=tuple(cfg.get("decay_efold", (1.0, 50.0))),
+            target_decay=cfg.get("target_decay", 0.996),
+            normalize_z=cfg.get("normalize_z", True),
+            gated_decay=cfg.get("gated_decay", False),
+            monthly_encoder=cfg.get("monthly_encoder", False),
+            gate_hidden=cfg.get("gate_hidden", 32),
+            annual_emission=(cfg.get("emission_weight", 0.0) > 0
+                             or cfg.get("emission_rollout_weight", 0.0) > 0),
+            emission_hidden=cfg.get("emission_hidden", 0),
+            enc_window_years=cfg.get("enc_window_years", 0),
+        )
+    src = f"{path} ['{weights_key}']"
     prefix = "ssm_encoder.ssm."
     sub = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
     if not sub:
@@ -273,7 +314,7 @@ def score_windows(jepa, y_m, u_m, ctx, H, starts, pooled):
         uf_ann = to_annual(uf)
         _, z_last = jepa.posterior(ye_c, ue_c)
         z_roll = jepa.roll_forward(z_last, uf_ann)
-        z_tgt_all = jepa.encode_target(torch.cat([ye_c, ye_f], 1), torch.cat([ue_c, ue_f], 1))
+        z_tgt_all = ref_encode(jepa, torch.cat([ye_c, ye_f], 1), torch.cat([ue_c, ue_f], 1))
         z_tgt = z_tgt_all[:, ctx:]
         z_prev = z_tgt_all[:, ctx - 1:-1]
         z_one = jepa.transition_mean(z_prev, uf_ann)
@@ -301,12 +342,12 @@ def long_rollout(jepa, y_m, u_m, ctx):
     u_ann = to_annual(u)
     _, z_last = jepa.posterior(*jepa.encoder_inputs(y[:, :ctx * MONTHS], u[:, :ctx * MONTHS]))
     z_roll = jepa.roll_forward(z_last, u_ann[:, ctx:])
-    z_tgt_all = jepa.encode_target(*jepa.encoder_inputs(y, u))
+    z_tgt_all = ref_encode(jepa, *jepa.encoder_inputs(y, u))
     res = dict(z_roll=z_roll[0].numpy(), z_tgt=z_tgt_all[0, ctx:].numpy(),
                u_ann=u_ann[0].numpy())
-    if jepa.annual_emission:
+    if has_emission(jepa):
         # normalised units; converted to physical in main()
-        res["y_emit"] = jepa.emit(z_roll)[0].numpy()
+        res["y_emit"] = emit_ann(jepa, z_roll, u_ann[:, ctx:])[0].numpy()
         res["y_ann"] = to_annual(y)[0, ctx:ctx + z_roll.shape[1]].numpy()
     if jepa.gated_decay:
         res["tau_roll"] = jepa.gated_efolding_years(z_last, u_ann[:, ctx:])[0].numpy()
@@ -346,6 +387,9 @@ def restart_gaps(rolls, lasts, restarts):
 @contextmanager
 def batch_stats(jepa):
     """Temporarily standardize with batch stats, as before `fit_z_stats`."""
+    if not hasattr(jepa, "z_stats_fitted"):
+        yield
+        return
     was = bool(jepa.z_stats_fitted)
     jepa.z_stats_fitted.fill_(False)
     try:
@@ -528,7 +572,9 @@ def main():
         raise SystemExit(f"no files found for {args.scenarios}")
     y_dim = trajs[0]["tas"].shape[1]
     jepa = load_jepa(args.run_dir, weights, args.weights_key, cfg, y_dim, 1)
-    if args.fit_z_stats:
+    if args.fit_z_stats and not uses_z_stats(jepa):
+        print("[z-stats] this latent process has no z standardization; --fit_z_stats ignored")
+    elif args.fit_z_stats:
         from proto_scales.fit_jepa_kl_z_stats import fit_on_training_set
         fit_on_training_set(jepa, args.run_dir, cfg, args.cluster)
 
@@ -541,10 +587,11 @@ def main():
     order = np.argsort(efold)
     print(f"[model] ctx {ctx} yr | horizon {H} yr | gated_decay {jepa.gated_decay} | "
           f"monthly_encoder {jepa.monthly_encoder} | "
-          f"normalize_z {jepa.normalize_z} | trans_mlp {jepa.trans_mlp is not None}")
+          f"normalize_z {uses_z_stats(jepa)} | trans_mlp {jepa.trans_mlp is not None}")
 
-    fitted = bool(jepa.z_stats_fitted) and jepa.normalize_z
-    if jepa.normalize_z and not fitted:
+    # no standardization at all (ELBO) -> the frame is fixed by construction
+    fitted = (not uses_z_stats(jepa)) or bool(jepa.z_stats_fitted)
+    if uses_z_stats(jepa) and not fitted:
         print("[warn] checkpoint has no fitted z stats -> batch stats everywhere. "
               "Run proto_scales.fit_jepa_kl_z_stats and pass --weights <...>_zstats")
     saved = {"efold": efold, "bnorm": bnorm}
@@ -564,9 +611,10 @@ def main():
             runs = {}
             if fitted:
                 runs["fixed"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=False)
-            with batch_stats(jepa):
-                runs["batchB1"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=False)
-                runs["batchPooled"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=True)
+            if uses_z_stats(jepa):
+                with batch_stats(jepa):
+                    runs["batchB1"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=False)
+                    runs["batchPooled"] = score_windows(jepa, y_m, u_m, ctx, H, starts, pooled=True)
             main_key = "fixed" if fitted else "batchB1"
             for k, r in runs.items():
                 plot_lead(r, order, efold, f"{tag}_{k}", out_dir)
@@ -578,9 +626,10 @@ def main():
                 row[f"roll_{k}"] = r["err_roll"].mean()
             row.update(pers=ref["err_pers"].mean(), one_step=ref["err_one"].mean(),
                        roll_last10=ref["err_roll"][:, -10:].mean())
-            other = runs["batchPooled"] if main_key == "batchB1" else runs["batchB1"]
-            dz = np.linalg.norm(ref["z_last"] - other["z_last"], axis=-1)
-            row["zlast_rel_diff"] = float((dz / (np.linalg.norm(ref["z_last"], axis=-1) + 1e-8)).mean())
+            if uses_z_stats(jepa):
+                other = runs["batchPooled"] if main_key == "batchB1" else runs["batchB1"]
+                dz = np.linalg.norm(ref["z_last"] - other["z_last"], axis=-1)
+                row["zlast_rel_diff"] = float((dz / (np.linalg.norm(ref["z_last"], axis=-1) + 1e-8)).mean())
             rows.append(row)
         else:
             print(f"[skip windows] {tr['name']}: {Y} yr < ctx+horizon {ctx + H}")
@@ -592,7 +641,7 @@ def main():
         if jepa.gated_decay:
             plot_long(lr, u_np, order, efold, bnorm, ctx, tag, out_dir,
                       key_a="tau_roll", key_b="tau_tgt", fname="gated_tau", ylab="tau")
-        if jepa.annual_emission:
+        if has_emission(jepa):
             R = y_dim
             def phys(a):
                 return np.concatenate([
@@ -623,7 +672,7 @@ def main():
             if rs:
                 rolls, lasts = restart_rollouts(jepa, y_m, u_m, rs)
                 with torch.no_grad():
-                    z_tgt_full = jepa.encode_target(*jepa.encoder_inputs(y_m[None], u_m[None]))[0].numpy()
+                    z_tgt_full = ref_encode(jepa, *jepa.encoder_inputs(y_m[None], u_m[None]))[0].numpy()
                 plot_restarts(rolls, z_tgt_full, rs, order, efold, gain,
                               args.traj_start_year, tag, out_dir)
                 for r in rs:
@@ -639,11 +688,14 @@ def main():
                     for d in order:
                         print(f"   d{d:<3d}{efold[d]:7.1f} {gain[d]:7.3f}  "
                               + "".join(f"{g:9.3f}" for g in gaps[:, d]))
-                if jepa.annual_emission:
+                if has_emission(jepa):
                     sel = [r for r in args.emit_regions if r in regions]
                     if sel:
                         with torch.no_grad():
-                            e_rolls = {r: phys(jepa.emit(torch.tensor(rolls[r])).numpy())
+                            u_ann_full = to_annual(u_m[None])[0]
+                            e_rolls = {r: phys(emit_ann(
+                                jepa, torch.tensor(rolls[r]),
+                                u_ann_full[r:r + rolls[r].shape[0]]).numpy())
                                        for r in rs}
                         y_ann_full = phys(to_annual(y_m[None])[0].numpy())
                         plot_restarts_emission(e_rolls, y_ann_full, rs, regions, sel,
