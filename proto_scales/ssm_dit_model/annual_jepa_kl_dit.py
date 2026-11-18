@@ -701,7 +701,7 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
     def __init__(self, jepa, y_dim, u_dim, jepa_weight=1.0,
                  jepa_rollout_weight=1.0, jepa_kl_free_bits=0.05,
                  jepa_cov_weight=1.0, emission_weight=0.0,
-                 emission_rollout_weight=0.0, **kwargs):
+                 emission_rollout_weight=0.0, detach_latents=False, **kwargs):
         super().__init__(
             ssm=jepa, y_dim=y_dim, u_dim=u_dim,
             ssm_elbo_weight=0.0, ssm_kl_weight=0.0, ssm_kl_free_bits=0.0,
@@ -713,6 +713,12 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
         self.jepa_cov_weight = float(jepa_cov_weight)
         self.emission_weight = float(emission_weight)
         self.emission_rollout_weight = float(emission_rollout_weight)
+        # True: the diffusion loss does not reach the latent process; z is
+        # shaped by the JEPA/emission terms only (which encode separately).
+        # Without it the DiT can build itself a lead-time clock in z: a dim
+        # with B = 0 and a fixed start value decays deterministically along
+        # the rollout, at no cost to the JEPA losses.
+        self.detach_latents = bool(detach_latents)
         if (self.emission_weight > 0 or self.emission_rollout_weight > 0) \
                 and not jepa.annual_emission:
             raise ValueError("emission weights > 0 need ForcedAnnualJEPAKL(annual_emission=True)")
@@ -720,6 +726,10 @@ class AnnualJEPAKLOutpaintingDiT(AnnualSSMOutpaintingDiT):
             self.jepa_weight > 0 or self.jepa_rollout_weight > 0
             or self.jepa_cov_weight > 0 or self.emission_weight > 0
             or self.emission_rollout_weight > 0)
+
+    def latents(self, tas_ctx, pr_ctx, u_ctx, u_fut):
+        z = self.ssm_encoder(tas_ctx, pr_ctx, u_ctx, u_fut, stochastic=self.stochastic_z)
+        return z.detach() if self.detach_latents else z
 
     def ssm_aux_loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut):
         """

@@ -91,6 +91,7 @@ def run_train(
     emission_rollout_weight=0.0,
     emission_hidden=0,
     enc_window_years=0,
+    detach_latents=False,
     # DiT
     cond_dim=256,
     hidden=384,
@@ -213,6 +214,7 @@ def run_train(
         jepa_cov_weight=jepa_cov_weight,
         emission_weight=emission_weight,
         emission_rollout_weight=emission_rollout_weight,
+        detach_latents=detach_latents,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -230,6 +232,8 @@ def run_train(
               f"{'monthly input, z at each year end' if monthly_encoder else 'annual means'}")
         print(f"[model] encoder lookback: "
               f"{f'fixed {enc_window_years} yr per year' if enc_window_years > 0 else 'whole window from h0=0'}")
+        print(f"[model] DiT gradients into z: "
+              f"{'OFF (detached)' if detach_latents else 'ON'}")
         print(f"[model] decay: "
               f"{f'gated by (z_prev, u_t), gate_hidden={gate_hidden}' if gated_decay else 'linear (hard-clamped)'}")
         if raw_model.use_ssm_aux:
