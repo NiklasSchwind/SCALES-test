@@ -24,7 +24,8 @@ from torch.utils.data import DataLoader
 import proto_scales.ssm_model.scales_ssm as scales_ssm
 from proto_scales.ssm_dit_model.annual_dit_training import LongHorizonWindowDataset, ModelEMA
 from proto_scales.ssm_dit_model.annual_elbo_dit import (
-    AnnualELBOOutpaintingDiT, ForcedAnnualELBO, fit_pattern_scaling)
+    AnnualELBOOutpaintingDiT, ForcedAnnualELBO, fit_pattern_scaling, load_matching,
+    ssm_state_from_file)
 from proto_scales.ssm_dit_model.memory_kernel import MONTHS_PER_YEAR
 
 
@@ -63,6 +64,11 @@ def run_train(
     enc_window_years=0,
     encoder_reads_pr=False,
     emission_hidden=0,
+    pr_emission=False,
+    pr_emission_hidden=64,
+    pr_weight=1.0,
+    pr_detach_z=True,
+    dit_residual=False,
     nll_weight=1.0,
     kl_weight=5.0,
     kl_warmup_epochs=5,
@@ -162,6 +168,7 @@ def run_train(
         gated_decay=gated_decay, gate_hidden=gate_hidden,
         monthly_encoder=monthly_encoder, enc_window_years=enc_window_years,
         encoder_reads_pr=encoder_reads_pr, emission_hidden=emission_hidden,
+        pr_emission=pr_emission, pr_emission_hidden=pr_emission_hidden,
     )
     # Frozen pattern scaling, fitted on the training split only.
     W_ps, b_ps, r2_ps = fit_pattern_scaling(tas_n[tr], u_n[tr], ridge=pattern_ridge)
@@ -170,12 +177,24 @@ def run_train(
         print(f"[pattern] annual tas ~ u fitted on {len(tr)} training trajectories "
               f"(ridge {pattern_ridge}) | R^2 median {np.median(r2_ps):.2f}, "
               f"range [{r2_ps.min():.2f}, {r2_ps.max():.2f}]")
-    if ssm_weights is not None:
-        ckpt = torch.load(ssm_weights, map_location="cpu")
-        missing, unexpected = ssm.load_state_dict(ckpt, strict=False)
+    if pr_emission:
+        W_pr, b_pr, r2_pr = fit_pattern_scaling(pr_n[tr], u_n[tr], ridge=pattern_ridge)
+        ssm.set_pr_pattern_scaling(W_pr, b_pr)
         if is_main:
-            print(f"[ssm] loaded {ssm_weights} | missing {len(missing)} | "
-                  f"unexpected {len(unexpected)}")
+            print(f"[pattern] annual pr ~ u | R^2 median {np.median(r2_pr):.2f}, "
+                  f"range [{r2_pr.min():.2f}, {r2_pr.max():.2f}]")
+    if ssm_weights is not None:
+        # Bare ELBO state dict, model_out or an epoch checkpoint. The pattern
+        # scalings just fitted are kept: a checkpoint's copy was fitted on the
+        # same split only if the seed and data are the same.
+        sd = ssm_state_from_file(ssm_weights)
+        sd = {k: v for k, v in sd.items() if not k.startswith("ps_")}
+        if is_main:
+            load_matching(ssm, sd, tag=f"ssm {ssm_weights}")
+        else:
+            ssm.load_state_dict({k: v for k, v in sd.items()
+                                 if k in ssm.state_dict()
+                                 and ssm.state_dict()[k].shape == v.shape}, strict=False)
     elif is_main:
         print("[ssm] no checkpoint given — latent process starts from random init")
 
@@ -189,6 +208,7 @@ def run_train(
         field_memory_rank=field_memory_rank,
         nll_weight=nll_weight, kl_weight=kl_weight, kl_free_bits=kl_free_bits,
         rollout_weight=rollout_weight, detach_latents=detach_latents,
+        dit_residual=dit_residual, pr_weight=pr_weight, pr_detach_z=pr_detach_z,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -208,7 +228,14 @@ def run_train(
         print(f"[model] decay: "
               f"{f'gated by (z_prev, u_t), gate_hidden={gate_hidden}' if gated_decay else 'linear (hard-clamped)'}")
         print(f"[model] emission: frozen pattern scaling(u) + "
-              f"{'linear' if not emission_hidden else f'MLP({emission_hidden})'} residual(z), tas only")
+              f"{'linear' if not emission_hidden else f'MLP({emission_hidden})'} residual(z) for tas")
+        if pr_emission:
+            print(f"[model] pr head: frozen pattern scaling(u) + "
+                  f"{'linear' if not pr_emission_hidden else f'MLP({pr_emission_hidden})'} "
+                  f"residual(z), Gaussian NLL + rollout MSE, weight {pr_weight}, "
+                  f"z {'detached' if pr_detach_z else 'trained by pr too'}")
+        print(f"[model] DiT target: "
+              f"{'residual field - SSM baseline (tas + pr)' if dit_residual else 'full field'}")
         if raw_model.use_ssm_aux:
             print(f"[model] ELBO ON: nll_weight={nll_weight}, beta={kl_weight} "
                   f"(warm-up {kl_warmup_epochs} epochs), kl_free_bits={kl_free_bits}, "
@@ -228,19 +255,13 @@ def run_train(
             src = f"{weights_file} ['{weights_key}']"
         else:
             src = weights_file
-        missing, unexpected = raw_model.load_state_dict(ckpt, strict=False)
+        # Pattern scalings fitted above win over the checkpoint's copies.
+        ckpt = {k: v for k, v in ckpt.items() if not k.startswith("ssm_encoder.ssm.ps_")}
         n_model = len(raw_model.state_dict())
-        n_loaded = n_model - len(missing)
-        if n_loaded == 0:
+        loaded, *_ = load_matching(raw_model, ckpt, tag=f"dit warm start {src}")
+        if not loaded:
             raise RuntimeError(f"[dit] warm start from {src} matched none of the "
                                f"{n_model} model keys — wrong file or architecture?")
-        if is_main:
-            print(f"[dit] warm start from {src} | loaded {n_loaded}/{n_model} | "
-                  f"missing {len(missing)} | unexpected {len(unexpected)}")
-            if missing:
-                print(f"[dit]   missing (first 10): {missing[:10]}")
-            if unexpected:
-                print(f"[dit]   unexpected (first 10): {unexpected[:10]}")
 
     n_par = sum(p.numel() for p in raw_model.parameters())
     n_tr = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)

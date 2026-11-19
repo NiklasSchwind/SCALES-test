@@ -47,6 +47,14 @@ KL makes encoding unpredictable interannual noise expensive, so unused dims
 collapse onto the prior (harmless: their mean rollout is ~0). Watch
 `kl_active_dims` instead of using free bits (default 0).
 
+pr head and residual DiT (optional, `pr_emission`, `dit_residual`)
+--------------------------------------------------------------------
+    p(pr_t | z_t, u_t)      = N(P_pr u_t + c_pr + res_pr(z_t), R_pr)
+
+trained outside the ELBO on detached z (see `ForcedAnnualELBO.pr_loss`).
+With `dit_residual` the DiT generates field - (tas, pr) baseline and the
+baseline is added back at sampling (see `AnnualELBOOutpaintingDiT`).
+
 DiT gradients
 --------------
 `detach_latents=True` (default): the diffusion loss does not reach the latent
@@ -66,7 +74,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from proto_scales.ssm_dit_model.annual_ssm import diag_gaussian_kl_per_dim, to_annual
+from proto_scales.ssm_dit_model.annual_ssm import (
+    MONTHS_PER_YEAR, broadcast_to_monthly, diag_gaussian_kl_per_dim, to_annual)
 from proto_scales.ssm_dit_model.annual_ssm_dit import AnnualSSMOutpaintingDiT
 
 MONTHS = 12
@@ -145,6 +154,15 @@ class ForcedAnnualELBO(nn.Module):
     encoder_reads_pr  : encoder also reads pr (default: tas + u only, as in
                         the original SSM).
     emission_hidden   : 0 -> linear residual res(z); > 0 -> one hidden layer.
+    pr_emission       : add an annual pr head, PS_pr(u) + res_pr(z), with its
+                        own frozen pattern scaling. It is not part of the
+                        ELBO: it is trained by `pr_loss` (Gaussian NLL on the
+                        posterior z + MSE along the rollout), on detached z by
+                        default, so pr's noise does not redefine z. It gives
+                        the DiT a pr baseline to generate residuals around.
+    pr_emission_hidden: width of res_pr's hidden layer (0 -> linear). The
+                        last layer is zero-initialised, so the head starts as
+                        pure pattern scaling.
     """
 
     def __init__(
@@ -161,6 +179,8 @@ class ForcedAnnualELBO(nn.Module):
         enc_window_years=0,
         encoder_reads_pr=False,
         emission_hidden=0,
+        pr_emission=False,
+        pr_emission_hidden=64,
     ):
         super().__init__()
         lo, hi = decay_efold_range
@@ -217,6 +237,22 @@ class ForcedAnnualELBO(nn.Module):
         )
         self.log_obs_var = nn.Parameter(torch.zeros(y_dim))
 
+        # Optional pr head (not in the ELBO; see `pr_loss`).
+        self.pr_emission = bool(pr_emission)
+        if self.pr_emission:
+            self.register_buffer("ps_pr_weight", torch.zeros(y_dim, u_dim))
+            self.register_buffer("ps_pr_bias", torch.zeros(y_dim))
+            self.register_buffer("ps_pr_fitted", torch.tensor(False))
+            self.emit_res_pr = (
+                nn.Sequential(nn.Linear(z_dim, pr_emission_hidden), nn.SiLU(),
+                              nn.Linear(pr_emission_hidden, y_dim))
+                if pr_emission_hidden else nn.Linear(z_dim, y_dim)
+            )
+            last = self.emit_res_pr[-1] if pr_emission_hidden else self.emit_res_pr
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+            self.log_obs_var_pr = nn.Parameter(torch.zeros(y_dim))
+
         self.register_buffer("enc_window_years", torch.tensor(int(enc_window_years)))
 
     # -----------------------
@@ -234,6 +270,22 @@ class ForcedAnnualELBO(nn.Module):
     def emit_mean(self, z, u):
         """Annual tas mean, [..., y_dim], from z and annual u."""
         return self.pattern_scaling(u) + self.emit_res(z)
+
+    @torch.no_grad()
+    def set_pr_pattern_scaling(self, W, b):
+        if not self.pr_emission:
+            raise ValueError("set_pr_pattern_scaling needs pr_emission=True")
+        self.ps_pr_weight.copy_(W)
+        self.ps_pr_bias.copy_(b)
+        self.ps_pr_fitted.fill_(True)
+
+    def emit_mean_pr(self, z, u):
+        """Annual pr mean, [..., y_dim], from z and annual u (pr head only)."""
+        return u @ self.ps_pr_weight.T + self.ps_pr_bias + self.emit_res_pr(z)
+
+    def emit_mean_field(self, z, u):
+        """[..., 2*y_dim]: (tas, pr) annual means, the DiT's residual baseline."""
+        return torch.cat([self.emit_mean(z, u), self.emit_mean_pr(z, u)], dim=-1)
 
     # -----------------------
     # transition
@@ -321,14 +373,15 @@ class ForcedAnnualELBO(nn.Module):
     # -----------------------
     # objectives
     # -----------------------
-    def elbo(self, ye, ue, tas_ann, u_ann, kl_free_bits=0.0):
+    def elbo(self, ye, ue, tas_ann, u_ann, kl_free_bits=0.0, return_z=False):
         """
         Returns (nll, kl, kl_per_dim). nll and kl are summed over regions /
         z-dims and years, averaged over the batch, and both divided by
         (years x regions), so their ratio is the summed ELBO's. kl_per_dim
         [z] is the mean KL per year per dim in nats (diagnostic).
         `kl_free_bits` clamps each step's total KL from below, as in the
-        original monthly SSM (default 0).
+        original monthly SSM (default 0). With `return_z`, the posterior
+        sample z_s [B, T, z] is appended (for the pr head, no second encode).
         """
         mu_q, logvar_q = self._encode_dist(ye, ue)
         B, T, _ = mu_q.shape
@@ -352,13 +405,35 @@ class ForcedAnnualELBO(nn.Module):
         kl = kl_step.sum(dim=1)
 
         norm = T * self.y_dim
-        return nll.mean() / norm, kl.mean() / norm, kl_dim.detach().mean(dim=(0, 1))
+        out = (nll.mean() / norm, kl.mean() / norm, kl_dim.detach().mean(dim=(0, 1)))
+        return out + (z_s,) if return_z else out
 
-    def rollout_loss(self, ye_ctx, ue_ctx, tas_fut_ann, u_fut_ann):
+    def rollout_loss(self, ye_ctx, ue_ctx, tas_fut_ann, u_fut_ann, return_z=False):
         """MSE of the emission mean along the mean rollout from z_last."""
         _, z_last = self.posterior(ye_ctx, ue_ctx)
         z_traj = self.roll_forward(z_last, u_fut_ann)
-        return ((self.emit_mean(z_traj, u_fut_ann) - tas_fut_ann) ** 2).mean()
+        loss = ((self.emit_mean(z_traj, u_fut_ann) - tas_fut_ann) ** 2).mean()
+        return (loss, z_traj) if return_z else loss
+
+    def pr_loss(self, z_post, u_ann, pr_ann, z_roll, u_fut_ann, pr_fut_ann, detach_z=True):
+        """
+        pr head objective: Gaussian NLL of annual pr on the posterior z
+        (per year per region, same normalisation as the tas NLL) plus the MSE
+        of the pr mean along the forcing-only rollout, the z the DiT baseline
+        uses in the future half. Returns (nll, roll_mse).
+
+        Gaussian, not sinh-arcsinh: the head only supplies the mean the DiT
+        generates residuals around; the shape of the pr distribution
+        (skew, tails) is the DiT's job, and annual means are close to
+        Gaussian anyway.
+        """
+        if detach_z:
+            z_post, z_roll = z_post.detach(), z_roll.detach()
+        lv = torch.clamp(self.log_obs_var_pr, -12.0, 6.0)
+        r = pr_ann - self.emit_mean_pr(z_post, u_ann)
+        nll = 0.5 * (r ** 2 * torch.exp(-lv) + lv + math.log(2.0 * math.pi)).mean()
+        roll = ((self.emit_mean_pr(z_roll, u_fut_ann) - pr_fut_ann) ** 2).mean()
+        return nll, roll
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -367,15 +442,35 @@ class ForcedAnnualELBO(nn.Module):
 class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
     """
     `AnnualSSMOutpaintingDiT` with a `ForcedAnnualELBO` latent process.
-    Overrides `latents` (detach) and `ssm_aux_loss`; DiT, conditioning,
-    flow-matching loss and block-wise sampling are inherited.
+    Overrides `latents` (detach), `ssm_aux_loss`, `loss` and `sample_blocks`;
+    the DiT, conditioning and flow-matching loss are inherited.
 
     `kl_weight` is beta; the training loop scales it by `kl_beta_scale`
     (warm-up, set via `set_kl_beta_scale`).
+
+    Residual DiT (`dit_residual=True`, needs the pr head)
+    ------------------------------------------------------
+    The DiT generates r = field - b(z, u), where b is the latent process's
+    annual (tas, pr) mean `emit_mean_field`, evaluated along the same z the
+    DiT is conditioned on (posterior over the context, mean rollout over the
+    future) and repeated over each year's months. Its context is residual
+    too. The level of the forecast then comes from the SSM, which is trained
+    with a rollout loss, and a free-running DiT has no level to drift on:
+    without this the DiT took the level from its own generated context and
+    drifted region by region (eval_elbo_dit_bias: teacher-forced fine,
+    free-running +0.2 K in SOO, -0.5 K in GIC). The baseline carries no DiT
+    gradient. `sample_blocks` adds it back, so callers get the full field.
+
+    pr head
+    -------
+    With `ssm.pr_emission`, `pr_weight * (pr_nll + pr_rollout)` is added to
+    the aux loss. On detached z by default (`pr_detach_z`), so it trains the
+    head only.
     """
 
     def __init__(self, ssm, y_dim, u_dim, nll_weight=1.0, kl_weight=5.0,
                  kl_free_bits=0.0, rollout_weight=1.0, detach_latents=True,
+                 dit_residual=False, pr_weight=1.0, pr_detach_z=True,
                  **kwargs):
         super().__init__(
             ssm=ssm, y_dim=y_dim, u_dim=u_dim,
@@ -388,8 +483,23 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         self.rollout_weight = float(rollout_weight)
         self.detach_latents = bool(detach_latents)
         self.kl_beta_scale = 1.0
-        self.use_ssm_aux = (not self.ssm_encoder.frozen) and (
-            self.nll_weight > 0 or self.rollout_weight > 0)
+        self.dit_residual = bool(dit_residual)
+        self.pr_detach_z = bool(pr_detach_z)
+        self.pr_weight = float(pr_weight) if ssm.pr_emission else 0.0
+        if self.dit_residual and not ssm.pr_emission:
+            raise ValueError("dit_residual needs a pr baseline: build the latent "
+                             "process with pr_emission=True")
+        frozen = self.ssm_encoder.frozen
+        if frozen and self.pr_weight > 0:
+            # A frozen latent process can still get a new pr head on top.
+            for m in (ssm.emit_res_pr,):
+                for prm in m.parameters():
+                    prm.requires_grad = True
+            ssm.log_obs_var_pr.requires_grad = True
+            if not self.pr_detach_z:
+                raise ValueError("pr_detach_z=False makes no sense with a frozen latent process")
+        self.use_ssm_aux = (self.pr_weight > 0) or (not frozen and (
+            self.nll_weight > 0 or self.rollout_weight > 0))
 
     def set_kl_beta_scale(self, s):
         self.kl_beta_scale = float(s)
@@ -398,55 +508,218 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         z = self.ssm_encoder(tas_ctx, pr_ctx, u_ctx, u_fut, stochastic=self.stochastic_z)
         return z.detach() if self.detach_latents else z
 
+    # ------------------------------------------------------------------
+    # residual baseline
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def field_baseline(self, z_all, u_all):
+        """
+        Monthly baseline [B, T, 2*y_dim] for z_all [B, T, z] (annual latents
+        repeated over months, as `latents` returns them) and monthly u_all.
+        Years are 12-month chunks from the window start, the same chunks z
+        is built on. Zero if not `dit_residual`.
+        """
+        B, T, _ = z_all.shape
+        if not self.dit_residual:
+            return z_all.new_zeros(B, T, self.in_channels)
+        u_ann_m = broadcast_to_monthly(to_annual(u_all), T)
+        return self.ssm_encoder.ssm.emit_mean_field(z_all, u_ann_m)
+
+    # ------------------------------------------------------------------
+    # training
+    # ------------------------------------------------------------------
+    def loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut,
+             block_idx=(0,), start_month=0, t=None, return_parts=False):
+        """`AnnualSSMOutpaintingDiT.loss`, on the residual field if `dit_residual`."""
+        n_fut = u_fut.shape[1]
+        z_all = self.latents(tas_ctx, pr_ctx, u_ctx, u_fut)
+        field_all = torch.cat([torch.cat([tas_ctx, tas_fut], dim=1),
+                               torch.cat([pr_ctx, pr_fut], dim=1)], dim=-1)
+        u_all = torch.cat([u_ctx, u_fut], dim=1)
+        if self.dit_residual:
+            field_all = field_all - self.field_baseline(z_all.detach(), u_all)
+
+        if isinstance(block_idx, torch.Tensor):
+            block_idx = block_idx.tolist()
+        elif isinstance(block_idx, int):
+            block_idx = [block_idx]
+
+        flow_terms, per_block = [], {}
+        for bi in block_idx:
+            w0, bs, nb = self.block_bounds(bi, n_fut)
+            win = slice(w0, bs + nb)
+            d = self.flow_matching_loss(
+                z_win=z_all[:, win], u_win=u_all[:, win], field_win=field_all[:, win],
+                n_block=nb, start_month=(int(start_month) + w0) % MONTHS_PER_YEAR, t=t)
+            flow_terms.append(d)
+            per_block[f"flow_blk{int(bi)}"] = d.detach()
+        flow_loss = torch.stack(flow_terms).mean()
+
+        parts = {"flow_matching": flow_loss.detach()}
+        if len(per_block) > 1:
+            parts.update(per_block)
+        total = flow_loss
+        if self.use_ssm_aux:
+            aux, aux_parts = self.ssm_aux_loss(
+                tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut)
+            total = total + aux
+            parts.update(aux_parts)
+            parts["ssm_aux_weighted"] = aux.detach()
+        return (total, parts) if return_parts else total
+
     def ssm_aux_loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut):
         ssm = self.ssm_encoder.ssm
+        frozen = self.ssm_encoder.frozen
         ye_ctx, ue_ctx = ssm.encoder_inputs(torch.cat([tas_ctx, pr_ctx], dim=-1), u_ctx)
         ye_fut, ue_fut = ssm.encoder_inputs(torch.cat([tas_fut, pr_fut], dim=-1), u_fut)
         u_ctx_ann, u_fut_ann = to_annual(u_ctx), to_annual(u_fut)
+        u_all_ann = torch.cat([u_ctx_ann, u_fut_ann], dim=1)
         tas_fut_ann = to_annual(tas_fut)
+        ye_all = torch.cat([ye_ctx, ye_fut], dim=1)
+        ue_all = torch.cat([ue_ctx, ue_fut], dim=1)
 
         parts = {}
         total = torch.zeros((), device=tas_ctx.device)
-        if self.nll_weight > 0:
-            nll, kl, kl_dim = ssm.elbo(
-                torch.cat([ye_ctx, ye_fut], dim=1), torch.cat([ue_ctx, ue_fut], dim=1),
-                torch.cat([to_annual(tas_ctx), tas_fut_ann], dim=1),
-                torch.cat([u_ctx_ann, u_fut_ann], dim=1),
-                kl_free_bits=self.kl_free_bits)
+        z_post = z_roll = None
+        if self.nll_weight > 0 and not frozen:
+            nll, kl, kl_dim, z_post = ssm.elbo(
+                ye_all, ue_all,
+                torch.cat([to_annual(tas_ctx), tas_fut_ann], dim=1), u_all_ann,
+                kl_free_bits=self.kl_free_bits, return_z=True)
             beta = self.kl_weight * self.kl_beta_scale
             total = total + self.nll_weight * nll + beta * kl
             parts["ssm_nll"] = nll.detach()
             parts["ssm_kl"] = kl.detach()
             parts["kl_active_dims"] = (kl_dim > 0.01).sum().float()
-        if self.rollout_weight > 0:
-            roll = ssm.rollout_loss(ye_ctx, ue_ctx, tas_fut_ann, u_fut_ann)
+        if self.rollout_weight > 0 and not frozen:
+            roll, z_roll = ssm.rollout_loss(ye_ctx, ue_ctx, tas_fut_ann, u_fut_ann,
+                                            return_z=True)
             total = total + self.rollout_weight * roll
             parts["ssm_rollout"] = roll.detach()
+
+        if self.pr_weight > 0:
+            # Reuse the encodings above; recompute only what was skipped.
+            if z_post is None:
+                with torch.set_grad_enabled(not self.pr_detach_z):
+                    z_post = ssm.posterior(ye_all, ue_all)[0]
+            if z_roll is None:
+                with torch.set_grad_enabled(not self.pr_detach_z):
+                    z_roll = ssm.roll_forward(ssm.posterior(ye_ctx, ue_ctx)[1], u_fut_ann)
+            pr_nll, pr_roll = ssm.pr_loss(
+                z_post, u_all_ann, to_annual(torch.cat([pr_ctx, pr_fut], dim=1)),
+                z_roll, u_fut_ann, to_annual(pr_fut), detach_z=self.pr_detach_z)
+            total = total + self.pr_weight * (pr_nll + pr_roll)
+            parts["pr_nll"] = pr_nll.detach()
+            parts["pr_rollout"] = pr_roll.detach()
         return total, parts
+
+    # ------------------------------------------------------------------
+    # sampling
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def sample_blocks(self, tas_ctx, pr_ctx, u_ctx, u_fut, start_month=0,
+                      n_steps=None, generator=None, z_all=None,
+                      tas_fut_true=None, pr_fut_true=None, return_baseline=False):
+        """
+        `AnnualSSMOutpaintingDiT.sample_blocks`, plus:
+          - residual mode: the DiT works on field - baseline, and the
+            baseline is added back to the output;
+          - `z_all` [B, n_ctx + n_fut, z] monthly: condition on this latent
+            trajectory instead of `latents(...)` (e.g. a full-history read);
+          - `tas_fut_true`/`pr_fut_true`: teacher forcing, every block's
+            context is the true field instead of the generated one
+            (diagnostic only);
+          - `return_baseline`: also return the baseline's (tas, pr) over the
+            future (zeros if not residual).
+        Returns (tas, pr[, tas_base, pr_base]), each [B, len(u_fut), y_dim].
+        """
+        H_total = u_fut.shape[1]
+        n_ctx = self.context_len
+        if z_all is None:
+            z_all = self.latents(tas_ctx, pr_ctx, u_ctx, u_fut)
+        u_all = torch.cat([u_ctx, u_fut], dim=1)
+        base = self.field_baseline(z_all, u_all)
+        hist = torch.cat([tas_ctx, pr_ctx], dim=-1) - base[:, :n_ctx]
+        tf = tas_fut_true is not None
+        if tf:
+            true_fut = torch.cat([tas_fut_true, pr_fut_true], dim=-1) - base[:, n_ctx:]
+            hist_true = torch.cat([hist, true_fut], dim=1)
+
+        out, done = [], 0
+        while done < H_total:
+            w0, bs, nb = self.block_bounds(done // self.block_len, H_total)
+            win = slice(w0, bs + nb)
+            field_ctx = (hist_true if tf else hist)[:, w0:bs]
+            cond = self.window_conditioning(
+                z_win=z_all[:, win], u_win=u_all[:, win], field_ctx=field_ctx,
+                n_block=nb, start_month=(int(start_month) + w0) % MONTHS_PER_YEAR)
+            blk = self._sample_window(cond, field_ctx, nb, n_steps, generator)
+            hist = torch.cat([hist, blk], dim=1)
+            out.append(blk)
+            done += nb
+
+        fut_base = base[:, n_ctx:n_ctx + H_total]
+        fut = torch.cat(out, dim=1) + fut_base
+        res = (fut[..., :self.y_dim], fut[..., self.y_dim:])
+        if return_baseline:
+            res = res + (fut_base[..., :self.y_dim], fut_base[..., self.y_dim:])
+        return res
 
 
 _SSM_KEYS = ("z_dim", "rnn_hidden", "trans_hidden", "decay_efold_range",
              "gated_decay", "gate_hidden", "monthly_encoder", "enc_window_years",
-             "encoder_reads_pr", "emission_hidden")
+             "encoder_reads_pr", "emission_hidden", "pr_emission",
+             "pr_emission_hidden")
+
+
+def load_matching(module, state_dict, tag="warm start"):
+    """
+    Non-strict load that also skips tensors whose shape differs (e.g. a
+    linear emission into an MLP one), which `load_state_dict(strict=False)`
+    would raise on. Returns (loaded, missing, unexpected, mismatched) key lists.
+    """
+    own = module.state_dict()
+    keep = {k: v for k, v in state_dict.items() if k in own and own[k].shape == v.shape}
+    mismatched = [k for k in state_dict if k in own and own[k].shape != state_dict[k].shape]
+    unexpected = [k for k in state_dict if k not in own]
+    missing = [k for k in own if k not in keep]
+    module.load_state_dict(keep, strict=False)
+    print(f"[{tag}] loaded {len(keep)}/{len(own)} | missing {len(missing)} | "
+          f"shape-mismatched {len(mismatched)} | unexpected {len(unexpected)}")
+    if missing:
+        print(f"[{tag}]   missing: {missing}")
+    if mismatched:
+        print(f"[{tag}]   shape-mismatched (left at init): {mismatched}")
+    return list(keep), missing, unexpected, mismatched
+
+
+def ssm_state_from_file(path, key="ema"):
+    """
+    Latent-process weights from any of: a bare `ForcedAnnualELBO` state dict,
+    a full-model `model_out`, or an epoch checkpoint {"model", "ema"} (`key`
+    picks which). Full-model keys are stripped of `ssm_encoder.ssm.`.
+    """
+    sd = torch.load(path, map_location="cpu")
+    if isinstance(sd, dict) and ("model" in sd or "ema" in sd):
+        sd = sd[key] if key in sd else sd["model"]
+    if any(k.startswith(_PFX) for k in sd):
+        sd = {k[len(_PFX):]: v for k, v in sd.items() if k.startswith(_PFX)}
+    return sd
 
 
 def build_model(y_dim, u_dim, device="cpu", ssm_weights=None, **kwargs):
     """
     Construct `AnnualELBOOutpaintingDiT`. Latent-process kwargs (`_SSM_KEYS`)
     go to `ForcedAnnualELBO`, the rest to the DiT. `ssm_weights` optionally
-    warm-starts the latent process (non-strict).
+    warm-starts the latent process (non-strict, shape mismatches skipped; a
+    full-model checkpoint works too).
     """
     ssm_kw = {k: kwargs.pop(k) for k in _SSM_KEYS if k in kwargs}
     if "decay_efold_range" in ssm_kw:
         ssm_kw["decay_efold_range"] = tuple(ssm_kw["decay_efold_range"])
     ssm = ForcedAnnualELBO(y_dim=y_dim, u_dim=u_dim, **ssm_kw)
     if ssm_weights is not None:
-        ckpt = torch.load(ssm_weights, map_location="cpu")
-        missing, unexpected = ssm.load_state_dict(ckpt, strict=False)
-        if missing:
-            print(f"[build_model] ELBO missing keys: {missing}")
-        if unexpected:
-            print(f"[build_model] ELBO unexpected keys ignored: {len(unexpected)}")
+        load_matching(ssm, ssm_state_from_file(ssm_weights), tag="build_model ssm")
     model = AnnualELBOOutpaintingDiT(ssm=ssm, y_dim=y_dim, u_dim=u_dim, **kwargs)
     return model.to(device)
 
@@ -468,6 +741,8 @@ _CFG_MAP = {
     "field_memory_rank": "field_memory_rank",
     "kl_weight": "kl_weight", "kl_free_bits": "kl_free_bits",
     "rollout_weight": "rollout_weight",
+    "dit_residual": "dit_residual", "pr_weight": "pr_weight",
+    "pr_detach_z": "pr_detach_z",
 }
 
 
@@ -514,6 +789,11 @@ def ssm_kwargs_from_state_dict(state_dict, y_dim, u_dim):
         kw["trans_hidden"] = int(state_dict[_PFX + "trans_mlp.0.weight"].shape[0])
     if _PFX + "decay_gate.0.weight" in state_dict:
         kw["gate_hidden"] = int(state_dict[_PFX + "decay_gate.0.weight"].shape[0])
+    kw["pr_emission"] = (_PFX + "ps_pr_weight") in state_dict
+    if kw["pr_emission"]:
+        kw["pr_emission_hidden"] = (
+            int(state_dict[_PFX + "emit_res_pr.0.weight"].shape[0])
+            if _PFX + "emit_res_pr.0.weight" in state_dict else 0)
     kw["z_dim"] = int(state_dict[_PFX + "log_process_var"].shape[0])
     kw["rnn_hidden"] = int(state_dict[_PFX + "gru.weight_hh_l0"].shape[1])
     return kw
@@ -582,8 +862,14 @@ def load_elbo_dit_annual(run_dir, y_dim, u_dim=1, device="gpu", ema=True,
     print(f"[load_elbo_dit_annual] loaded {which} weights from {path}")
 
     kw = model_kwargs_from_config(read_run_config(run_dir))
-    kw.update(ssm_kwargs_from_state_dict(state_dict, y_dim, u_dim))
     kw.update(model_kwargs)
+    # Architecture read off the weights wins over config.txt and explicit
+    # kwargs: a contradicting value could never load (strict load below).
+    for k, v in ssm_kwargs_from_state_dict(state_dict, y_dim, u_dim).items():
+        if k in model_kwargs and model_kwargs[k] != v:
+            print(f"[load_elbo_dit_annual] ignoring {k}={model_kwargs[k]!r}: "
+                  f"checkpoint has {k}={v!r}")
+        kw[k] = v
     model = build_model(y_dim, u_dim, device=device, **kw)
     model.load_state_dict(state_dict)
     model.eval()

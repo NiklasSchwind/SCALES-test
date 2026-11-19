@@ -200,6 +200,8 @@ def emit_ann(m, z, u_ann):
     residual(z), tas only, pr filled with NaN so the plots/units code is shared.
     """
     if is_elbo(m):
+        if getattr(m, "pr_emission", False):
+            return m.emit_mean_field(z, u_ann)
         tas = m.emit_mean(z, u_ann)
         return torch.cat([tas, torch.full_like(tas, float("nan"))], dim=-1)
     return m.emit(z)

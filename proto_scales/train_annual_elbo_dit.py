@@ -115,7 +115,7 @@ if __name__ == "__main__":
 
     # latent process
     p.add_argument("--ssm_weights", type=str, default=None,
-                   help="Warm-start weights for the ForcedAnnualELBO only")
+                   help="Warm-start weights for the ForcedAnnualELBO only: a bare ELBO state dict, a model_out or an epoch checkpoint (EMA weights). Shape-mismatched tensors (e.g. a new --emission_hidden) stay at init")
     p.add_argument("--scaler_run_dir", type=str, default=None,
                    help="Reuse y/pr/u scalers from an earlier run directory")
     p.add_argument("--freeze_ssm", action="store_true",
@@ -138,6 +138,16 @@ if __name__ == "__main__":
                    help="Encoder also reads pr (default: tas + u, as in the original SSM)")
     p.add_argument("--emission_hidden", type=int, default=0,
                    help="0: linear residual emission from z; > 0: one hidden layer of this width")
+    p.add_argument("--pr_emission", action="store_true",
+                   help="Add an annual pr head: frozen pattern scaling(u) + residual(z). Trained on detached z unless --pr_trains_z; required by --dit_residual")
+    p.add_argument("--pr_emission_hidden", type=int, default=64,
+                   help="Hidden width of the pr head's residual MLP (0: linear)")
+    p.add_argument("--pr_weight", type=float, default=1.0,
+                   help="Weight of the pr head loss (Gaussian NLL on the posterior z + rollout MSE)")
+    p.add_argument("--pr_trains_z", action="store_false", dest="pr_detach_z",
+                   help="Let the pr head's loss train the latent process too")
+    p.add_argument("--dit_residual", action="store_true",
+                   help="DiT generates field - SSM baseline (tas and pr means from z, u) and the baseline is added back at sampling. Needs --pr_emission")
     p.add_argument("--pattern_ridge", type=float, default=1e-3,
                    help="Ridge penalty for the frozen pattern-scaling fit (relative to the number of training years)")
     p.add_argument("--nll_weight", type=float, default=1.0,
@@ -191,6 +201,8 @@ if __name__ == "__main__":
     p.add_argument("--ckpt_every", type=int, default=10)
 
     args = p.parse_args()
+    if args.dit_residual and not args.pr_emission:
+        p.error("--dit_residual needs --pr_emission (the pr baseline comes from the pr head)")
 
     MODEL_PATH = MODEL_PATH_ASC if args.cluster == "ASC" else MODEL_PATH_IIASA
     TRAIN_SCENARIOS.extend(args.add_data)
@@ -226,6 +238,10 @@ if __name__ == "__main__":
             enc_window_years=args.enc_window_years,
             encoder_reads_pr=args.encoder_reads_pr,
             emission_hidden=args.emission_hidden,
+            pr_emission=args.pr_emission,
+            pr_emission_hidden=args.pr_emission_hidden,
+            pr_weight=args.pr_weight, pr_detach_z=args.pr_detach_z,
+            dit_residual=args.dit_residual,
             nll_weight=args.nll_weight, kl_weight=args.kl_weight,
             kl_warmup_epochs=args.kl_warmup_epochs,
             kl_free_bits=args.kl_free_bits, rollout_weight=args.rollout_weight,
