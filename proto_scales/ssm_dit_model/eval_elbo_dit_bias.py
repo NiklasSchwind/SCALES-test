@@ -10,11 +10,14 @@ Run on the cluster from the repo root, e.g.
         --scenarios ssp126 --start_years 1860 2010 --n_samples 10
 
 For each trajectory and start year S, the DiT gets `context_len` months of
-true field before S and generates S..end. All curves are annual, unweighted
-means over regions, in K (the same metric for every curve, so they compare
-with each other; it is not area-weighted GSAT).
+true field before S and generates S..end. Curves are annual, in K, for the
+unweighted regional mean and for single regions (--regions plus the
+--auto_regions worst ones). The regional mean is NOT a useful bias test on
+its own: pattern scaling of u (the ESM's own GSAT) pins it to the ESM, so a
+forced-response bias shows up only in regions that lag GSAT (oceans, SOO).
+`region_bias_<traj>_<S>.csv` ranks every region by its bias over years 51+.
 
-Curves (`bias_<traj>_<S>.png`, top: levels, bottom: minus ESM)
+Curves (`bias_<traj>_<S>_<target>.png`, top: levels, bottom: minus ESM)
 ----------------------------------------------------------------
     ESM           the trajectory itself
     SSM emit      ssm.emit_mean(z_roll, u): pattern scaling + residual(z),
@@ -116,12 +119,16 @@ def sample(model, z_all, u_all, field_ctx, field_true_fut, n_steps, generator,
 # ─────────────────────────────────────────────────────────────────────────────
 # helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def gmean_K(tas_norm_ann, tas_sc):
-    """[..., Y, R] normalised annual tas -> [..., Y] unweighted regional mean in K."""
+def to_K(tas_norm_ann, tas_sc):
+    """[..., Y, R] normalised annual tas -> [..., Y, R] in K."""
     a = np.asarray(tas_norm_ann)
     shp = a.shape
-    phys = tas_sc.inverse_transform(a.reshape(1, -1, shp[-1]))[0].reshape(shp)
-    return phys.mean(-1)
+    return tas_sc.inverse_transform(a.reshape(1, -1, shp[-1]))[0].reshape(shp)
+
+
+def select(a, target, regions):
+    """[..., R] -> [...]: unweighted regional mean ('mean') or one region."""
+    return a.mean(-1) if target == "mean" else a[..., regions.index(target)]
 
 
 def lead_bins(Y, block_years):
@@ -178,6 +185,12 @@ def main():
     p.add_argument("--n_steps", type=int, default=None, help="flow steps (default: model's)")
     p.add_argument("--no_full_history", action="store_true",
                    help="skip the full-history-z variants (saves one DiT ensemble)")
+    p.add_argument("--regions", nargs="+", default=["SOO"],
+                   help="regions to plot besides the regional mean")
+    p.add_argument("--auto_regions", type=int, default=3,
+                   help="also plot the N regions with the largest DiT-free bias")
+    p.add_argument("--top_regions", type=int, default=15,
+                   help="rows of the printed per-region bias ranking")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="gpu")
     p.add_argument("--out_dir", default=None, help="default: <run_dir>/eval_bias_<ckpt>")
@@ -204,7 +217,9 @@ def main():
     ctx_yr = n_ctx // MONTHS
     block_yr = model.block_len // MONTHS
     print(f"[model] context {ctx_yr} yr | block {block_yr} yr | "
-          f"enc_window_years {int(ssm.enc_window_years)} | device {dev}")
+          f"enc_window_years {int(ssm.enc_window_years)} | device {dev} | "
+          f"flow steps {args.n_steps or model.n_flow_steps}"
+          f"{'' if args.n_steps else ' (model default)'}")
 
     tag_ck = "latest" if ckpt in (None, "latest") else str(ckpt)
     out_dir = args.out_dir or os.path.join(args.run_dir, f"eval_bias_{tag_ck}")
@@ -245,14 +260,14 @@ def main():
                                     u_t[None, :m1].expand(B, -1, -1))
 
             years = S + np.arange(Y - s)
-            esm = gmean_K(esm_ann_all[s:], tas_sc)
-            curves = {}
+            esm = to_K(esm_ann_all[s:], tas_sc)                            # [Y, R]
+            curves = {}                                                    # name -> [Y, R]
             for vk, (y_hist, u_hist) in variants.items():
                 sfx = "" if vk == "ctx" else "(full)"
                 z_all, z_fut_ann = latent_trajectory(ssm, y_hist, u_hist, u_fut, n_ctx)
                 with torch.no_grad():
                     emit = ssm.emit_mean(z_fut_ann[:1], u_fut_ann[:1])[0].cpu().numpy()
-                curves[f"SSM emit{sfx}"] = gmean_K(emit, tas_sc)
+                curves[f"SSM emit{sfx}"] = to_K(emit, tas_sc)
 
                 modes = [("free", False)] + ([("tf", True)] if vk == "ctx" else [])
                 for mk, tf in modes:
@@ -262,7 +277,7 @@ def main():
                     fut = sample(model, z_all, u_all, field_ctx, field_fut,
                                  args.n_steps, gen, teacher_forced=tf)
                     tas_ann = to_annual(fut[..., :y_dim]).cpu().numpy()   # [B, Y, R]
-                    g = gmean_K(tas_ann, tas_sc)                           # [B, Y]
+                    g = to_K(tas_ann, tas_sc)                              # [B, Y, R]
                     curves[f"DiT {mk}{sfx}"] = g.mean(0)
                     saved[f"{tag}/dit_{mk}_{vk}_samples"] = g
 
@@ -271,26 +286,50 @@ def main():
             saved[f"{tag}/esm"] = esm
             saved[f"{tag}/years"] = years
 
-            plot(years, curves, esm,
-                 f"{tr['name']} | start {S} | ctx {ctx_yr} yr | "
-                 f"DiT = mean of {B} samples | unweighted regional mean",
-                 os.path.join(out_dir, f"bias_{tag}.png"))
+            # Per-region ranking: the regional mean is dominated by pattern
+            # scaling of u (the ESM's own GSAT), so a bias only shows up in
+            # regions whose response lags GSAT (oceans, SOO, ...).
+            late = slice(min(50, len(years) - 1), None)
+            rb = pd.DataFrame({k: (v - esm)[late].mean(0) for k, v in curves.items()},
+                              index=regions)
+            rb.index.name = "region"
+            rb.to_csv(os.path.join(out_dir, f"region_bias_{tag}.csv"))
+            sort_key = "DiT free" if "DiT free" in rb else rb.columns[0]
+            rb_sorted = rb.reindex(rb[sort_key].abs().sort_values(ascending=False).index)
+            with pd.option_context("display.width", 200, "display.float_format", "{:.3f}".format):
+                print(f"\n[{tag}] mean bias over years 51+ [K], top {args.top_regions} "
+                      f"regions by |{sort_key}|")
+                print(rb_sorted.head(args.top_regions).to_string())
+
+            targets = ["mean"] + [r for r in args.regions if r in regions]
+            targets += [r for r in rb_sorted.index[:args.auto_regions] if r not in targets]
+            missing = sorted(set(args.regions) - set(regions))
+            if missing:
+                print(f"[warn] --regions not found: {missing}; available: {regions}")
 
             bins = lead_bins(len(years), block_yr)
-            for k, v in curves.items():
-                row = dict(traj=name, start=S, curve=k)
-                for bk, sl in bins.items():
-                    row[bk] = float((v - esm)[sl].mean())
-                rows.append(row)
-
-            # per-block bias of the DiT ensembles: does it step up block by block?
             nb = int(np.ceil(len(years) / block_yr))
-            print(f"\n[{tag}] bias per DiT block [K] (block = {block_yr} yr)")
-            print("   block  " + "".join(f"{k:>16s}" for k in curves))
-            for b in range(nb):
-                sl = slice(b * block_yr, (b + 1) * block_yr)
-                print(f"   {b:5d}  " + "".join(f"{(v - esm)[sl].mean():16.3f}"
-                                             for v in curves.values()))
+            for tgt in targets:
+                e = select(esm, tgt, regions)
+                cv = {k: select(v, tgt, regions) for k, v in curves.items()}
+                lab = "unweighted regional mean" if tgt == "mean" else f"region {tgt}"
+                plot(years, cv, e,
+                     f"{tr['name']} | start {S} | ctx {ctx_yr} yr | "
+                     f"DiT = mean of {B} samples | {lab}",
+                     os.path.join(out_dir, f"bias_{tag}_{tgt}.png"))
+                for k, v in cv.items():
+                    row = dict(traj=name, start=S, target=tgt, curve=k)
+                    for bk, sl in bins.items():
+                        row[bk] = float((v - e)[sl].mean())
+                    rows.append(row)
+
+                # per-block bias: does it step up block by block?
+                print(f"\n[{tag} | {tgt}] bias per DiT block [K] (block = {block_yr} yr)")
+                print("   block  " + "".join(f"{k:>16s}" for k in cv))
+                for b in range(nb):
+                    sl = slice(b * block_yr, (b + 1) * block_yr)
+                    print(f"   {b:5d}  " + "".join(f"{(v - e)[sl].mean():16.3f}"
+                                                 for v in cv.values()))
 
     if rows:
         df = pd.DataFrame(rows)
