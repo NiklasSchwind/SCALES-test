@@ -43,6 +43,7 @@ def run_train(
     tas_np, pr_np, u_np,
     context_len=120,
     enc_context_len=None,
+    enc_context_min=None,
     horizon=1200,
     block_len=120,
     blocks_per_step=2,
@@ -71,6 +72,8 @@ def run_train(
     pr_detach_z=True,
     dit_residual=False,
     rollout_obs_var=False,
+    ssm_only=False,
+    ctx_offset_std=0.0,
     nll_weight=1.0,
     kl_weight=5.0,
     kl_warmup_epochs=5,
@@ -143,6 +146,15 @@ def run_train(
     u_n = u_scaler.transform(u_np)
 
     enc_context_len = context_len if enc_context_len is None else int(enc_context_len)
+    enc_context_min = enc_context_len if enc_context_min is None else int(enc_context_min)
+    if (enc_context_min % MONTHS_PER_YEAR or enc_context_min < context_len
+            or enc_context_min > enc_context_len):
+        raise ValueError(
+            f"enc_context_min must be whole years in [context_len, enc_context_len] "
+            f"= [{context_len}, {enc_context_len}]; got {enc_context_min}")
+    if enc_window_years > 0 and enc_context_min < enc_context_len:
+        print("[warn] enc_window_years > 0 caps every read anyway; a random encoder "
+              "context length only changes the ELBO window")
     if enc_window_years > 0 and enc_window_years * MONTHS_PER_YEAR > enc_context_len:
         raise ValueError(
             f"enc_window_years={enc_window_years} exceeds the encoder context "
@@ -163,6 +175,11 @@ def run_train(
               f"({(enc_context_len + horizon) / MONTHS_PER_YEAR:.0f} yr; encoder context "
               f"{enc_context_len // MONTHS_PER_YEAR} yr, DiT context "
               f"{context_len // MONTHS_PER_YEAR} yr)")
+        if enc_context_min < enc_context_len:
+            print(f"[data] encoder read length drawn per step from "
+                  f"{enc_context_min // MONTHS_PER_YEAR}-{enc_context_len // MONTHS_PER_YEAR} "
+                  f"yr (last months of each window's context); validation uses the full "
+                  f"{enc_context_len // MONTHS_PER_YEAR} yr")
         T_chunk = tas_np.shape[1]
         if T_chunk - (enc_context_len + horizon) < stride:
             print(f"[data] NOTE: chunks are {T_chunk} months, so each chunk yields "
@@ -196,11 +213,16 @@ def run_train(
             print(f"[pattern] annual pr ~ u | R^2 median {np.median(r2_pr):.2f}, "
                   f"range [{r2_pr.min():.2f}, {r2_pr.max():.2f}]")
     if ssm_weights is not None:
-        # Bare ELBO state dict, model_out or an epoch checkpoint. The pattern
-        # scalings just fitted are kept: a checkpoint's copy was fitted on the
-        # same split only if the seed and data are the same.
+        # Bare ELBO state dict, model_out or an epoch checkpoint. Its pattern
+        # scalings replace the ones just fitted: the emission residuals in the
+        # checkpoint were trained against them, and they differ from a refit
+        # whenever the scenarios, chunking or split changed. Scalings the
+        # checkpoint lacks (a new pr head) keep the fit above.
         sd = ssm_state_from_file(ssm_weights)
-        sd = {k: v for k, v in sd.items() if not k.startswith("ps_")}
+        if is_main and scaler_run_dir is None:
+            print("[warn] --ssm_weights without --scaler_run_dir: the latent process "
+                  "was trained in another run's normalised units. Pass that run's "
+                  "directory unless data and split are identical.")
         if is_main:
             load_matching(ssm, sd, tag=f"ssm {ssm_weights}")
         else:
@@ -222,10 +244,19 @@ def run_train(
         rollout_weight=rollout_weight, detach_latents=detach_latents,
         dit_residual=dit_residual, pr_weight=pr_weight, pr_detach_z=pr_detach_z,
         enc_context_len=enc_context_len, rollout_obs_var=rollout_obs_var,
+        ssm_only=ssm_only, ctx_offset_std=ctx_offset_std,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
     blocks_per_step = max(1, min(int(blocks_per_step), n_blocks))
+    if is_main and ssm_only:
+        print("[model] SSM-ONLY: training the latent process alone (ELBO + rollout"
+              f"{' + pr head' if pr_emission else ''}); the DiT is frozen and never "
+              "run. 'val' is the latent-process loss at full beta. Reuse with "
+              "--ssm_weights <run>/model_out --freeze_ssm")
+    if is_main and ctx_offset_std > 0 and not ssm_only:
+        print(f"[model] context-offset augmentation: per-sample std ~ U(0, "
+              f"{ctx_offset_std}) in normalised units, context only, training only")
     if is_main:
         print(f"[model] linear flow matching, {n_flow_steps} sampling steps by default")
         print(f"[model] {n_blocks} DiT blocks per super-window, "
@@ -269,8 +300,7 @@ def run_train(
             src = f"{weights_file} ['{weights_key}']"
         else:
             src = weights_file
-        # Pattern scalings fitted above win over the checkpoint's copies.
-        ckpt = {k: v for k, v in ckpt.items() if not k.startswith("ssm_encoder.ssm.ps_")}
+        # The checkpoint's pattern scalings replace the fit above (see --ssm_weights).
         n_model = len(raw_model.state_dict())
         loaded, *_ = load_matching(raw_model, ckpt, tag=f"dit warm start {src}")
         if not loaded:
@@ -335,6 +365,14 @@ def run_train(
             # mean all phases are seen across an epoch.
             start_month = int(sm[0].item())
             blocks = rng.choice(n_blocks, size=blocks_per_step, replace=False).tolist()
+            if enc_context_min < enc_context_len:
+                # Random encoder read length, so the GRU (h0 = 0) sees a range
+                # of lengths and a longer read at inference is not out of
+                # distribution. Whole years are dropped from the front, so
+                # start_month is unchanged.
+                L = int(rng.integers(enc_context_min // MONTHS_PER_YEAR,
+                                     enc_context_len // MONTHS_PER_YEAR + 1)) * MONTHS_PER_YEAR
+                tas_c, pr_c, u_c = tas_c[:, -L:], pr_c[:, -L:], u_c[:, -L:]
 
             loss, parts = model(tas_c, pr_c, u_c, tas_f, pr_f, u_f,
                                 block_idx=blocks, start_month=start_month,

@@ -168,6 +168,12 @@ if __name__ == "__main__":
                    help="Context window in months; must be a whole number of years")
     p.add_argument("--enc_context_len", type=int, default=None,
                    help="Months of history the latent encoder reads (whole years, >= --context_len; default = --context_len). Training windows carry this much context; the DiT still attends over the last --context_len. E.g. 600 as in the original SSM")
+    p.add_argument("--enc_context_min", type=int, default=None,
+                   help="Shortest encoder read in months (whole years, >= --context_len). If below --enc_context_len, each training step encodes the last L months with L drawn uniformly in whole years from [min, enc_context_len], so the encoder learns to work with any read length up to the maximum (default: fixed --enc_context_len)")
+    p.add_argument("--ssm_only", action="store_true",
+                   help="Train the latent process alone (ELBO + rollout + pr head): no DiT pass, DiT frozen. Much cheaper per step; check it with eval_jepa_rollout / eval_elbo_dit_bias --ssm_only, then train the DiT with --ssm_weights <run>/model_out --freeze_ssm")
+    p.add_argument("--ctx_offset_std", type=float, default=0.0,
+                   help="DiT context-offset augmentation: each training window's context gets a constant offset per sample and channel, N(0, s^2) with s ~ U(0, this) in normalised units; targets untouched. Teaches the DiT not to carry the level of its context from block to block. 0 = off; try the size of the drift to suppress, e.g. 0.2-0.3")
     p.add_argument("--rollout_obs_var", action="store_true",
                    help="Rollout loss = 0.5 r^2 / learned per-region obs variance (gradient stopped) instead of plain MSE: same scale as the ELBO NLL, and low-noise regions get their weight")
     p.add_argument("--chunk_len", type=int, default=N,
@@ -209,6 +215,8 @@ if __name__ == "__main__":
     p.add_argument("--ckpt_every", type=int, default=10)
 
     args = p.parse_args()
+    if args.ssm_only and args.freeze_ssm:
+        p.error("--ssm_only with --freeze_ssm leaves nothing to train")
     if args.dit_residual and not args.pr_emission:
         p.error("--dit_residual needs --pr_emission (the pr baseline comes from the pr head)")
 
@@ -238,6 +246,7 @@ if __name__ == "__main__":
         model, tas_scaler, pr_scaler, u_scaler = dit_training.run_train(
             tas, pr, u,
             context_len=args.context_len, enc_context_len=args.enc_context_len,
+            enc_context_min=args.enc_context_min,
             horizon=args.horizon,
             block_len=args.block_len, blocks_per_step=args.blocks_per_step,
             batch_size=args.batch_size, epochs=args.epochs, lr=args.lr,
@@ -257,6 +266,7 @@ if __name__ == "__main__":
             pr_weight=args.pr_weight, pr_detach_z=args.pr_detach_z,
             dit_residual=args.dit_residual,
             rollout_obs_var=args.rollout_obs_var,
+            ssm_only=args.ssm_only, ctx_offset_std=args.ctx_offset_std,
             nll_weight=args.nll_weight, kl_weight=args.kl_weight,
             kl_warmup_epochs=args.kl_warmup_epochs,
             kl_free_bits=args.kl_free_bits, rollout_weight=args.rollout_weight,

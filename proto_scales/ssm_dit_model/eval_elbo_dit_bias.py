@@ -166,6 +166,8 @@ def main():
     p.add_argument("--n_steps", type=int, default=None, help="flow steps (default: model's)")
     p.add_argument("--no_full_history", action="store_true",
                    help="skip the full-history-z variants (saves one DiT ensemble)")
+    p.add_argument("--ssm_only", action="store_true",
+                   help="only the SSM emission curves, no DiT sampling (fast; for --ssm_only training runs)")
     p.add_argument("--vars", nargs="+", default=list(VARS), choices=list(VARS))
     p.add_argument("--regions", nargs="+", default=["SOO"],
                    help="regions to plot besides the regional mean")
@@ -262,6 +264,8 @@ def main():
                             ssm.emit_mean_pr(z1, u_fut_ann)[0].cpu().numpy(), pr_sc)
 
                 modes = [("free", False)] + ([("tf", True)] if vk == "ctx" else [])
+                if args.ssm_only:
+                    modes = []
                 for mk, tf in modes:
                     gen.manual_seed(args.seed)
                     print(f"[sample] {tag} z={vk} {mk}: {B} samples x "
@@ -281,6 +285,9 @@ def main():
             nb = int(np.ceil(len(years) / block_yr))
             for v in args.vars:
                 cv_all, e_all = curves[v], esm[v]
+                if not cv_all:
+                    print(f"[{tag} | {v}] no curves (no pr head / --ssm_only); skipped")
+                    continue
                 for k, a in cv_all.items():
                     saved[f"{tag}/{v}/{k}"] = a
                 saved[f"{tag}/{v}/esm"] = e_all

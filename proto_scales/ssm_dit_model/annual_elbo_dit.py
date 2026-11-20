@@ -487,7 +487,27 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
     `context_len`. z_last, and with it every rollout, then starts from a
     read long enough to place the slow (ocean) dims; 10 yr from h0 = 0 is
     not. `loss` crops z, field and u to the DiT frame after encoding;
-    `sample_blocks` encodes the last `enc_context_len` months it is given.
+    `sample_blocks` encodes all the history it is given (`enc_months`).
+
+    SSM-only training (`ssm_only=True`)
+    -----------------------------------
+    `loss` is the latent-process objective alone (ELBO, rollout, pr head);
+    no DiT pass, DiT parameters frozen. With `detach_latents` the DiT never
+    shaped z anyway, so the latent process can be trained and checked on its
+    own (cheap), then reused via `ssm_weights` + `freeze_ssm`.
+
+    Context-offset augmentation (`ctx_offset_std` > 0, training mode only)
+    ----------------------------------------------------------------------
+    Each DiT window's context gets a constant offset per sample and channel,
+    N(0, s^2) with s ~ U(0, ctx_offset_std) per sample (normalised units);
+    the generated half and its target are untouched. Teacher forcing alone
+    teaches "continue the level of the context", which is right for a true
+    context and is what makes a free-running DiT carry and amplify its own
+    offsets from block to block. With the offsets the level of the context
+    is no longer a reliable predictor, so the DiT learns to return to what
+    z, u (and the baseline) say. Cost: it also discounts real decadal
+    persistence, by about var_persist / (var_persist + s^2). Pick
+    ctx_offset_std near the drift to suppress, not larger.
 
     pr head
     -------
@@ -500,6 +520,7 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
                  kl_free_bits=0.0, rollout_weight=1.0, detach_latents=True,
                  dit_residual=False, pr_weight=1.0, pr_detach_z=True,
                  enc_context_len=None, rollout_obs_var=False,
+                 ssm_only=False, ctx_offset_std=0.0,
                  **kwargs):
         super().__init__(
             ssm=ssm, y_dim=y_dim, u_dim=u_dim,
@@ -525,17 +546,23 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         if self.dit_residual and not ssm.pr_emission:
             raise ValueError("dit_residual needs a pr baseline: build the latent "
                              "process with pr_emission=True")
+        # A frozen latent process is frozen entirely, pr head included: the
+        # DiT's baseline must not move under it.
         frozen = self.ssm_encoder.frozen
-        if frozen and self.pr_weight > 0:
-            # A frozen latent process can still get a new pr head on top.
-            for m in (ssm.emit_res_pr,):
-                for prm in m.parameters():
-                    prm.requires_grad = True
-            ssm.log_obs_var_pr.requires_grad = True
-            if not self.pr_detach_z:
-                raise ValueError("pr_detach_z=False makes no sense with a frozen latent process")
-        self.use_ssm_aux = (self.pr_weight > 0) or (not frozen and (
-            self.nll_weight > 0 or self.rollout_weight > 0))
+        self.use_ssm_aux = (not frozen) and (
+            self.nll_weight > 0 or self.rollout_weight > 0 or self.pr_weight > 0)
+        self.ctx_offset_std = float(ctx_offset_std)
+        self.ssm_only = bool(ssm_only)
+        if self.ssm_only:
+            if not self.use_ssm_aux:
+                raise ValueError("ssm_only: no latent-process objective is active "
+                                 "(frozen latent process or all weights 0)")
+            # The DiT is not on the path to the loss: freeze it, so DDP does
+            # not raise on parameters without gradient and the optimiser
+            # leaves it alone. Checkpoints keep the full-model layout.
+            for mod in (self.dit, self.cond_builder):
+                for prm in mod.parameters():
+                    prm.requires_grad = False
 
     def set_kl_beta_scale(self, s):
         self.kl_beta_scale = float(s)
@@ -575,7 +602,14 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
     # ------------------------------------------------------------------
     def loss(self, tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut,
              block_idx=(0,), start_month=0, t=None, return_parts=False):
-        """`AnnualSSMOutpaintingDiT.loss`, on the residual field if `dit_residual`."""
+        """
+        `AnnualSSMOutpaintingDiT.loss`, on the residual field if
+        `dit_residual`; the latent-process objective alone if `ssm_only`.
+        """
+        if self.ssm_only:
+            aux, parts = self.ssm_aux_loss(tas_ctx, pr_ctx, u_ctx, tas_fut, pr_fut, u_fut)
+            parts["ssm_aux_weighted"] = aux.detach()
+            return (aux, parts) if return_parts else aux
         n_fut = u_fut.shape[1]
         z_all = self.latents(tas_ctx, pr_ctx, u_ctx, u_fut)
         field_all = torch.cat([torch.cat([tas_ctx, tas_fut], dim=1),
@@ -600,8 +634,18 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         for bi in block_idx:
             w0, bs, nb = self.block_bounds(bi, n_fut)
             win = slice(w0, bs + nb)
+            field_win = field_all[:, win]
+            if self.training and self.ctx_offset_std > 0:
+                # Offset the context only. `flow_matching_loss` takes both the
+                # conditioning and the clean context tokens from the first
+                # context_len steps and scores only the generated ones.
+                B, _, C = field_win.shape
+                s_b = torch.rand(B, 1, 1, device=field_win.device) * self.ctx_offset_std
+                shift = s_b * torch.randn(B, 1, C, device=field_win.device)
+                field_win = torch.cat([field_win[:, :self.context_len] + shift,
+                                       field_win[:, self.context_len:]], dim=1)
             d = self.flow_matching_loss(
-                z_win=z_all[:, win], u_win=u_all[:, win], field_win=field_all[:, win],
+                z_win=z_all[:, win], u_win=u_all[:, win], field_win=field_win,
                 n_block=nb, start_month=(int(start_month) + w0) % MONTHS_PER_YEAR, t=t)
             flow_terms.append(d)
             per_block[f"flow_blk{int(bi)}"] = d.detach()
@@ -673,14 +717,19 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
     @torch.no_grad()
     def sample_blocks(self, tas_ctx, pr_ctx, u_ctx, u_fut, start_month=0,
                       n_steps=None, generator=None, z_all=None,
-                      tas_fut_true=None, pr_fut_true=None, return_baseline=False):
+                      tas_fut_true=None, pr_fut_true=None, return_baseline=False,
+                      enc_months="all"):
         """
         `AnnualSSMOutpaintingDiT.sample_blocks`, plus:
           - residual mode: the DiT works on field - baseline, and the
             baseline is added back to the output;
           - the history may be longer than `context_len` (whole years beyond
-            it): the latent process reads its last `enc_context_len` months,
-            the DiT the last `context_len`;
+            it). The DiT reads the last `context_len` months; the latent
+            process reads the last `enc_months` of it:
+              "all"  -> everything passed (default; like the original SSM,
+                        the GRU encodes whatever history it is given)
+              None   -> the last `enc_context_len` months (the training length)
+              int    -> that many months (whole years, capped at the history)
           - `z_all` [B, context_len + n_fut, z] monthly (DiT frame): condition
             on this latent trajectory instead (e.g. a full-history read);
           - `tas_fut_true`/`pr_fut_true`: teacher forcing, every block's
@@ -694,13 +743,24 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         n_ctx = self.context_len
         off = self._dit_offset(tas_ctx.shape[1])
         if z_all is None:
-            if tas_ctx.shape[1] < self.enc_context_len:
+            n_hist = tas_ctx.shape[1]
+            if enc_months is None:
+                want = self.enc_context_len
+            elif enc_months == "all":
+                want = n_hist
+            else:
+                want = int(enc_months)
+            if want < self.context_len:
+                raise ValueError(f"enc_months={enc_months}: the encoder must read at "
+                                 f"least context_len ({self.context_len}) months")
+            if n_hist < want or (enc_months == "all" and n_hist < self.enc_context_len):
                 warnings.warn(
-                    f"sample_blocks got {tas_ctx.shape[1]} months of history; the latent "
-                    f"process was trained on {self.enc_context_len}. Pass more history "
-                    f"(only the last {self.context_len} months reach the DiT).")
-            n_enc = min(tas_ctx.shape[1], self.enc_context_len)
-            n_enc -= n_enc % MONTHS_PER_YEAR
+                    f"sample_blocks got {n_hist} months of history; the latent "
+                    f"process was trained on reads of up to {self.enc_context_len}. "
+                    f"Pass more history (only the last {self.context_len} months "
+                    f"reach the DiT).")
+            n_enc = min(n_hist, want)
+            n_enc -= (n_enc - n_ctx) % MONTHS_PER_YEAR
             z_all = self.latents(tas_ctx[:, -n_enc:], pr_ctx[:, -n_enc:],
                                  u_ctx[:, -n_enc:], u_fut)[:, n_enc - n_ctx:]
         tas_ctx, pr_ctx, u_ctx = tas_ctx[:, off:], pr_ctx[:, off:], u_ctx[:, off:]
