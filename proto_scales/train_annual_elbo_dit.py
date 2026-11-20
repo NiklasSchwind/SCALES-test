@@ -43,7 +43,7 @@ MODEL_PATH_IIASA = f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 MODEL_PATH_ASC = f'/gpfs/data/fs73093/kain/CMIP6/cmip6-ng-inc-oceans/{MODEL}'
 
 
-def load_data(model_path, train_scenarios):
+def load_data(model_path, train_scenarios, n=N, n_skip=n_skip):
     """Identical to the other training scripts; returns (tas, pr, u) as [N, T, D]."""
     potential_files = prep.get_all_files_(model_path)
 
@@ -94,7 +94,7 @@ def load_data(model_path, train_scenarios):
         for t in train_data_df]
 
     train_data_input, train_data_output = prep.prepare_all_train_data(
-        train_data_np, n=N, n_skip=n_skip)
+        train_data_np, n=n, n_skip=n_skip)
     shuffled = prep.shuffle_train_data(train_data_input, train_data_output, random_state=42)
 
     u = shuffled[0][0, :].T[..., None]
@@ -166,6 +166,14 @@ if __name__ == "__main__":
     # DiT
     p.add_argument("--context_len", type=int, default=120,
                    help="Context window in months; must be a whole number of years")
+    p.add_argument("--enc_context_len", type=int, default=None,
+                   help="Months of history the latent encoder reads (whole years, >= --context_len; default = --context_len). Training windows carry this much context; the DiT still attends over the last --context_len. E.g. 600 as in the original SSM")
+    p.add_argument("--rollout_obs_var", action="store_true",
+                   help="Rollout loss = 0.5 r^2 / learned per-region obs variance (gradient stopped) instead of plain MSE: same scale as the ELBO NLL, and low-noise regions get their weight")
+    p.add_argument("--chunk_len", type=int, default=N,
+                   help="Length in months of the training chunks cut from each trajectory; must be >= encoder context + horizon")
+    p.add_argument("--chunk_skip", type=int, default=n_skip,
+                   help="Months between chunk starts. With chunk_len = context + horizon each chunk is one window, so this sets the variety; use a value coprime with 12 (e.g. 67)")
     p.add_argument("--horizon", type=int, default=1200,
                    help="Future length per training item in months. The z rollout spans all of it; DiT blocks are sampled from inside it")
     p.add_argument("--block_len", type=int, default=120,
@@ -209,7 +217,12 @@ if __name__ == "__main__":
     TRAIN_SCENARIOS = [s for s in TRAIN_SCENARIOS if s not in args.rm_data]
     print("MODEL_PATH", MODEL_PATH)
 
-    tas, pr, u = load_data(MODEL_PATH, TRAIN_SCENARIOS)
+    enc_ctx = args.enc_context_len or args.context_len
+    if args.chunk_len < enc_ctx + args.horizon:
+        p.error(f"--chunk_len {args.chunk_len} < encoder context + horizon "
+                f"({enc_ctx + args.horizon})")
+    tas, pr, u = load_data(MODEL_PATH, TRAIN_SCENARIOS, n=args.chunk_len,
+                           n_skip=args.chunk_skip)
     print("tas", tas.shape, "pr", pr.shape, "GMT", u.shape)
 
     run_dir = os.path.join("outputs_ssm_scales",
@@ -224,7 +237,8 @@ if __name__ == "__main__":
     try:
         model, tas_scaler, pr_scaler, u_scaler = dit_training.run_train(
             tas, pr, u,
-            context_len=args.context_len, horizon=args.horizon,
+            context_len=args.context_len, enc_context_len=args.enc_context_len,
+            horizon=args.horizon,
             block_len=args.block_len, blocks_per_step=args.blocks_per_step,
             batch_size=args.batch_size, epochs=args.epochs, lr=args.lr,
             weight_decay=args.weight_decay, warmup_steps=args.warmup_steps,
@@ -242,6 +256,7 @@ if __name__ == "__main__":
             pr_emission_hidden=args.pr_emission_hidden,
             pr_weight=args.pr_weight, pr_detach_z=args.pr_detach_z,
             dit_residual=args.dit_residual,
+            rollout_obs_var=args.rollout_obs_var,
             nll_weight=args.nll_weight, kl_weight=args.kl_weight,
             kl_warmup_epochs=args.kl_warmup_epochs,
             kl_free_bits=args.kl_free_bits, rollout_weight=args.rollout_weight,

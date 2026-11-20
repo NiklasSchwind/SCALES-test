@@ -557,7 +557,8 @@ def main():
     args = p.parse_args()
 
     cfg = read_config(args.run_dir)
-    ctx = args.context_years or cfg.get("context_len", 120) // MONTHS
+    # the latent process's own context (longer than the DiT's with --enc_context_len)
+    ctx = args.context_years or (cfg.get("enc_context_len") or cfg.get("context_len", 120)) // MONTHS
     H = args.horizon_years or cfg.get("horizon", 1200) // MONTHS
     weights, wtag = resolve_weights(args.run_dir, args.weights, args.checkpoint)
     out_dir = args.out_dir or os.path.join(args.run_dir, f"eval_rollout_{wtag}")

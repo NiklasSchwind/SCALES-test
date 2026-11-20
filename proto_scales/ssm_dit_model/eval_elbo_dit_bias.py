@@ -30,8 +30,9 @@ Curves (`bias_<var>_<traj>_<S>_<target>.png`, top: levels, bottom: minus ESM)
                    only with a pr head). In residual mode this IS the DiT's
                    baseline. Deterministic.
     SSM emit(full) same, z_last read from the whole history since the
-                   trajectory start instead of only the `context_len` window
-                   (what `sample_blocks` uses).
+                   trajectory start instead of the last `enc_context_len`
+                   months (what `sample_blocks` reads; = `context_len` for
+                   runs without --enc_context_len).
     DiT free       the forecast: each block's context is the DiT's own
                    previous output. Mean over --n_samples.
     DiT free(full) as DiT free, z from the full-history read.
@@ -199,7 +200,9 @@ def main():
     n_ctx = model.context_len
     ctx_yr = n_ctx // MONTHS
     block_yr = model.block_len // MONTHS
-    print(f"[model] context {ctx_yr} yr | block {block_yr} yr | "
+    enc_yr = getattr(model, "enc_context_len", n_ctx) // MONTHS
+    print(f"[model] DiT context {ctx_yr} yr | encoder context {enc_yr} yr | "
+          f"block {block_yr} yr | "
           f"enc_window_years {int(ssm.enc_window_years)} | device {dev} | "
           f"flow steps {args.n_steps or model.n_flow_steps}"
           f"{'' if args.n_steps else ' (model default)'} | "
@@ -231,6 +234,7 @@ def main():
             tag = f"{i:02d}_{name}_{S}"
             B = args.n_samples
             m0, m1 = (s - ctx_yr) * MONTHS, s * MONTHS
+            me = max(0, s - enc_yr) * MONTHS       # encoder history start (forecast)
 
             def rep(x):
                 return x[None].expand(B, *x.shape).contiguous()
@@ -239,8 +243,8 @@ def main():
             tas_fut, pr_fut, u_fut = rep(tas[m1:]), rep(pr[m1:]), rep(u[m1:])
             u_fut_ann = to_annual(u_fut[:1])
 
-            variants = {"ctx": (rep(field[m0:m1]), u_ctx)}
-            if not args.no_full_history and m0 > 0:
+            variants = {"ctx": (rep(field[me:m1]), rep(u[me:m1]))}
+            if not args.no_full_history and me > 0:
                 variants["full"] = (rep(field[:m1]), rep(u[:m1]))
 
             years = S + np.arange(Y - s)
@@ -306,7 +310,7 @@ def main():
                     cv = {k: select(a, tgt, regions) for k, a in cv_all.items()}
                     lab = "unweighted regional mean" if tgt == "mean" else f"region {tgt}"
                     plot(years, cv, e,
-                         f"{tr['name']} | {v} | start {S} | ctx {ctx_yr} yr | "
+                         f"{tr['name']} | {v} | start {S} | ctx {ctx_yr}/{enc_yr} yr | "
                          f"DiT = mean of {B} samples | {lab}",
                          f"{v} [{UNITS[v]}]",
                          os.path.join(out_dir, f"bias_{v}_{tag}_{tgt}.png"))

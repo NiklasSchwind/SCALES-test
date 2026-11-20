@@ -69,6 +69,7 @@ import glob
 import math
 import os
 import re
+import warnings
 
 import numpy as np
 import torch
@@ -408,14 +409,30 @@ class ForcedAnnualELBO(nn.Module):
         out = (nll.mean() / norm, kl.mean() / norm, kl_dim.detach().mean(dim=(0, 1)))
         return out + (z_s,) if return_z else out
 
-    def rollout_loss(self, ye_ctx, ue_ctx, tas_fut_ann, u_fut_ann, return_z=False):
-        """MSE of the emission mean along the mean rollout from z_last."""
+    def rollout_loss(self, ye_ctx, ue_ctx, tas_fut_ann, u_fut_ann, return_z=False,
+                     obs_var_scaled=False):
+        """
+        Error of the emission mean along the mean rollout from z_last.
+
+        Default: plain MSE. With `obs_var_scaled`, 0.5 * r^2 / sigma^2 with the
+        ELBO's learned per-region observation variance (gradient stopped):
+        the rollout then pulls on the mean exactly as hard as the NLL does
+        (NLL gradient r / sigma^2 vs MSE gradient 2r, so at weight 1 a plain
+        MSE is 1 / (2 sigma^2) times weaker; with annual means sigma^2 is
+        small), and each region is weighted by its own noise level, so
+        low-noise regions such as SOO are not drowned out by noisy land.
+        """
         _, z_last = self.posterior(ye_ctx, ue_ctx)
         z_traj = self.roll_forward(z_last, u_fut_ann)
-        loss = ((self.emit_mean(z_traj, u_fut_ann) - tas_fut_ann) ** 2).mean()
+        r2 = (self.emit_mean(z_traj, u_fut_ann) - tas_fut_ann) ** 2
+        if obs_var_scaled:
+            inv_var = torch.exp(-torch.clamp(self.log_obs_var, -12.0, 6.0)).detach()
+            r2 = 0.5 * r2 * inv_var
+        loss = r2.mean()
         return (loss, z_traj) if return_z else loss
 
-    def pr_loss(self, z_post, u_ann, pr_ann, z_roll, u_fut_ann, pr_fut_ann, detach_z=True):
+    def pr_loss(self, z_post, u_ann, pr_ann, z_roll, u_fut_ann, pr_fut_ann, detach_z=True,
+                obs_var_scaled=False):
         """
         pr head objective: Gaussian NLL of annual pr on the posterior z
         (per year per region, same normalisation as the tas NLL) plus the MSE
@@ -432,8 +449,10 @@ class ForcedAnnualELBO(nn.Module):
         lv = torch.clamp(self.log_obs_var_pr, -12.0, 6.0)
         r = pr_ann - self.emit_mean_pr(z_post, u_ann)
         nll = 0.5 * (r ** 2 * torch.exp(-lv) + lv + math.log(2.0 * math.pi)).mean()
-        roll = ((self.emit_mean_pr(z_roll, u_fut_ann) - pr_fut_ann) ** 2).mean()
-        return nll, roll
+        r2 = (self.emit_mean_pr(z_roll, u_fut_ann) - pr_fut_ann) ** 2
+        if obs_var_scaled:
+            r2 = 0.5 * r2 * torch.exp(-lv).detach()
+        return nll, r2.mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -461,6 +480,15 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
     free-running +0.2 K in SOO, -0.5 K in GIC). The baseline carries no DiT
     gradient. `sample_blocks` adds it back, so callers get the full field.
 
+    Encoder context (`enc_context_len`)
+    -----------------------------------
+    The latent process reads `enc_context_len` months of history (training
+    windows supply that much context), the DiT still attends over the last
+    `context_len`. z_last, and with it every rollout, then starts from a
+    read long enough to place the slow (ocean) dims; 10 yr from h0 = 0 is
+    not. `loss` crops z, field and u to the DiT frame after encoding;
+    `sample_blocks` encodes the last `enc_context_len` months it is given.
+
     pr head
     -------
     With `ssm.pr_emission`, `pr_weight * (pr_nll + pr_rollout)` is added to
@@ -471,6 +499,7 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
     def __init__(self, ssm, y_dim, u_dim, nll_weight=1.0, kl_weight=5.0,
                  kl_free_bits=0.0, rollout_weight=1.0, detach_latents=True,
                  dit_residual=False, pr_weight=1.0, pr_detach_z=True,
+                 enc_context_len=None, rollout_obs_var=False,
                  **kwargs):
         super().__init__(
             ssm=ssm, y_dim=y_dim, u_dim=u_dim,
@@ -485,6 +514,13 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         self.kl_beta_scale = 1.0
         self.dit_residual = bool(dit_residual)
         self.pr_detach_z = bool(pr_detach_z)
+        self.rollout_obs_var = bool(rollout_obs_var)
+        enc_context_len = self.context_len if enc_context_len is None else int(enc_context_len)
+        if enc_context_len % MONTHS_PER_YEAR or enc_context_len < self.context_len:
+            raise ValueError(
+                f"enc_context_len must be whole years and >= context_len "
+                f"({self.context_len}); got {enc_context_len}")
+        self.enc_context_len = enc_context_len
         self.pr_weight = float(pr_weight) if ssm.pr_emission else 0.0
         if self.dit_residual and not ssm.pr_emission:
             raise ValueError("dit_residual needs a pr baseline: build the latent "
@@ -503,6 +539,15 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
 
     def set_kl_beta_scale(self, s):
         self.kl_beta_scale = float(s)
+
+    def _dit_offset(self, n_hist):
+        """Months of history before the DiT window starts (whole years)."""
+        off = int(n_hist) - self.context_len
+        if off < 0 or off % MONTHS_PER_YEAR:
+            raise ValueError(
+                f"history of {n_hist} months: need >= context_len "
+                f"({self.context_len}) and a whole number of years beyond it")
+        return off
 
     def latents(self, tas_ctx, pr_ctx, u_ctx, u_fut):
         z = self.ssm_encoder(tas_ctx, pr_ctx, u_ctx, u_fut, stochastic=self.stochastic_z)
@@ -536,6 +581,13 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         field_all = torch.cat([torch.cat([tas_ctx, tas_fut], dim=1),
                                torch.cat([pr_ctx, pr_fut], dim=1)], dim=-1)
         u_all = torch.cat([u_ctx, u_fut], dim=1)
+        # The encoder read the whole (enc_context_len) context; the DiT frame
+        # starts context_len months before the future. Whole years, so the
+        # annual chunks of the baseline stay aligned with z's.
+        off = self._dit_offset(tas_ctx.shape[1])
+        if off:
+            z_all, field_all, u_all = z_all[:, off:], field_all[:, off:], u_all[:, off:]
+            start_month = int(start_month) + off
         if self.dit_residual:
             field_all = field_all - self.field_baseline(z_all.detach(), u_all)
 
@@ -593,7 +645,8 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
             parts["kl_active_dims"] = (kl_dim > 0.01).sum().float()
         if self.rollout_weight > 0 and not frozen:
             roll, z_roll = ssm.rollout_loss(ye_ctx, ue_ctx, tas_fut_ann, u_fut_ann,
-                                            return_z=True)
+                                            return_z=True,
+                                            obs_var_scaled=self.rollout_obs_var)
             total = total + self.rollout_weight * roll
             parts["ssm_rollout"] = roll.detach()
 
@@ -607,7 +660,8 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
                     z_roll = ssm.roll_forward(ssm.posterior(ye_ctx, ue_ctx)[1], u_fut_ann)
             pr_nll, pr_roll = ssm.pr_loss(
                 z_post, u_all_ann, to_annual(torch.cat([pr_ctx, pr_fut], dim=1)),
-                z_roll, u_fut_ann, to_annual(pr_fut), detach_z=self.pr_detach_z)
+                z_roll, u_fut_ann, to_annual(pr_fut), detach_z=self.pr_detach_z,
+                obs_var_scaled=self.rollout_obs_var)
             total = total + self.pr_weight * (pr_nll + pr_roll)
             parts["pr_nll"] = pr_nll.detach()
             parts["pr_rollout"] = pr_roll.detach()
@@ -624,8 +678,11 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         `AnnualSSMOutpaintingDiT.sample_blocks`, plus:
           - residual mode: the DiT works on field - baseline, and the
             baseline is added back to the output;
-          - `z_all` [B, n_ctx + n_fut, z] monthly: condition on this latent
-            trajectory instead of `latents(...)` (e.g. a full-history read);
+          - the history may be longer than `context_len` (whole years beyond
+            it): the latent process reads its last `enc_context_len` months,
+            the DiT the last `context_len`;
+          - `z_all` [B, context_len + n_fut, z] monthly (DiT frame): condition
+            on this latent trajectory instead (e.g. a full-history read);
           - `tas_fut_true`/`pr_fut_true`: teacher forcing, every block's
             context is the true field instead of the generated one
             (diagnostic only);
@@ -635,8 +692,18 @@ class AnnualELBOOutpaintingDiT(AnnualSSMOutpaintingDiT):
         """
         H_total = u_fut.shape[1]
         n_ctx = self.context_len
+        off = self._dit_offset(tas_ctx.shape[1])
         if z_all is None:
-            z_all = self.latents(tas_ctx, pr_ctx, u_ctx, u_fut)
+            if tas_ctx.shape[1] < self.enc_context_len:
+                warnings.warn(
+                    f"sample_blocks got {tas_ctx.shape[1]} months of history; the latent "
+                    f"process was trained on {self.enc_context_len}. Pass more history "
+                    f"(only the last {self.context_len} months reach the DiT).")
+            n_enc = min(tas_ctx.shape[1], self.enc_context_len)
+            n_enc -= n_enc % MONTHS_PER_YEAR
+            z_all = self.latents(tas_ctx[:, -n_enc:], pr_ctx[:, -n_enc:],
+                                 u_ctx[:, -n_enc:], u_fut)[:, n_enc - n_ctx:]
+        tas_ctx, pr_ctx, u_ctx = tas_ctx[:, off:], pr_ctx[:, off:], u_ctx[:, off:]
         u_all = torch.cat([u_ctx, u_fut], dim=1)
         base = self.field_baseline(z_all, u_all)
         hist = torch.cat([tas_ctx, pr_ctx], dim=-1) - base[:, :n_ctx]
@@ -743,6 +810,7 @@ _CFG_MAP = {
     "rollout_weight": "rollout_weight",
     "dit_residual": "dit_residual", "pr_weight": "pr_weight",
     "pr_detach_z": "pr_detach_z",
+    "enc_context_len": "enc_context_len", "rollout_obs_var": "rollout_obs_var",
 }
 
 

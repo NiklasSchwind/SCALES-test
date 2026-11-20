@@ -42,6 +42,7 @@ def _load_scalers(run_dir):
 def run_train(
     tas_np, pr_np, u_np,
     context_len=120,
+    enc_context_len=None,
     horizon=1200,
     block_len=120,
     blocks_per_step=2,
@@ -69,6 +70,7 @@ def run_train(
     pr_weight=1.0,
     pr_detach_z=True,
     dit_residual=False,
+    rollout_obs_var=False,
     nll_weight=1.0,
     kl_weight=5.0,
     kl_warmup_epochs=5,
@@ -140,14 +142,16 @@ def run_train(
     pr_n = pr_scaler.transform(pr_np)
     u_n = u_scaler.transform(u_np)
 
-    if enc_window_years > 0 and enc_window_years * MONTHS_PER_YEAR > context_len:
+    enc_context_len = context_len if enc_context_len is None else int(enc_context_len)
+    if enc_window_years > 0 and enc_window_years * MONTHS_PER_YEAR > enc_context_len:
         raise ValueError(
-            f"enc_window_years={enc_window_years} exceeds the context "
-            f"({context_len / MONTHS_PER_YEAR:.0f} yr): z_last would be a shorter "
+            f"enc_window_years={enc_window_years} exceeds the encoder context "
+            f"({enc_context_len / MONTHS_PER_YEAR:.0f} yr): z_last would be a shorter "
             f"read than the rollout targets")
 
     # ---- data --------------------------------------------------------------
-    ds_kw = dict(context_len=context_len, horizon=horizon, stride=stride,
+    # Windows carry the encoder's (longer) context; the DiT crops its own.
+    ds_kw = dict(context_len=enc_context_len, horizon=horizon, stride=stride,
                  data_start_month=data_start_month)
     train_ds = LongHorizonWindowDataset(tas_n[tr], pr_n[tr], u_n[tr], **ds_kw)
     val_ds = LongHorizonWindowDataset(tas_n[va], pr_n[va], u_n[va], **ds_kw)
@@ -155,8 +159,16 @@ def run_train(
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     if is_main:
         print(f"[data] train windows {len(train_ds)} | val windows {len(val_ds)} | "
-              f"super-window {context_len + horizon} months "
-              f"({(context_len + horizon) / MONTHS_PER_YEAR:.0f} yr)")
+              f"super-window {enc_context_len + horizon} months "
+              f"({(enc_context_len + horizon) / MONTHS_PER_YEAR:.0f} yr; encoder context "
+              f"{enc_context_len // MONTHS_PER_YEAR} yr, DiT context "
+              f"{context_len // MONTHS_PER_YEAR} yr)")
+        T_chunk = tas_np.shape[1]
+        if T_chunk - (enc_context_len + horizon) < stride:
+            print(f"[data] NOTE: chunks are {T_chunk} months, so each chunk yields "
+                  f"{(T_chunk - enc_context_len - horizon) // stride + 1} window(s); "
+                  f"lower --chunk_skip (coprime with 12, e.g. 67) or raise "
+                  f"--chunk_len for more variety")
 
     # ---- model -------------------------------------------------------------
     Dy = tas_np.shape[-1]
@@ -209,6 +221,7 @@ def run_train(
         nll_weight=nll_weight, kl_weight=kl_weight, kl_free_bits=kl_free_bits,
         rollout_weight=rollout_weight, detach_latents=detach_latents,
         dit_residual=dit_residual, pr_weight=pr_weight, pr_detach_z=pr_detach_z,
+        enc_context_len=enc_context_len, rollout_obs_var=rollout_obs_var,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -239,7 +252,8 @@ def run_train(
         if raw_model.use_ssm_aux:
             print(f"[model] ELBO ON: nll_weight={nll_weight}, beta={kl_weight} "
                   f"(warm-up {kl_warmup_epochs} epochs), kl_free_bits={kl_free_bits}, "
-                  f"rollout_weight={rollout_weight}")
+                  f"rollout_weight={rollout_weight} "
+                  f"({'0.5 r^2 / obs var, NLL scale' if rollout_obs_var else 'plain MSE'})")
         print(f"[model] DiT gradients into z: "
               f"{'OFF (detached)' if detach_latents else 'ON'}")
 
