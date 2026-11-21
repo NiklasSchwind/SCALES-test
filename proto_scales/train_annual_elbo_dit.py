@@ -138,6 +138,19 @@ if __name__ == "__main__":
                    help="Encoder also reads pr (default: tas + u, as in the original SSM)")
     p.add_argument("--emission_hidden", type=int, default=0,
                    help="0: linear residual emission from z; > 0: one hidden layer of this width")
+    p.add_argument("--reservoir_k", type=int, default=4,
+                   help="Forcing-only pathway as in the original SSM: u-GRU on annual GSAT + this many slow reservoirs per region, read by both emissions. 0 = off (z alone carries the forced response)")
+    p.add_argument("--u_rnn_hidden", type=int, default=32,
+                   help="Hidden size of the forcing GRU")
+    p.add_argument("--reservoir_tau", nargs=2, type=float, default=[2.0, 1000.0],
+                   metavar=("LOW", "HIGH"),
+                   help="Bounds of the reservoir e-folding times in YEARS (log-spaced init)")
+    p.add_argument("--z_forced", action="store_true",
+                   help="Keep B u_t in the z transition (the old filter-bank z). Default off: with reservoirs, z is the unforced state. --trans_hidden adds an MLP(z, u) either way")
+    p.add_argument("--cond_mem_u", action="store_false", dest="cond_baseline",
+                   help="DiT conditioning with the old window-local GSAT memory kernels instead of the projected SSM baseline")
+    p.add_argument("--baseline_rank", type=int, default=32,
+                   help="Width of the baseline projection in the DiT conditioning")
     p.add_argument("--pr_emission", action="store_true",
                    help="Add an annual pr head: frozen pattern scaling(u) + residual(z). Trained on detached z unless --pr_trains_z; required by --dit_residual")
     p.add_argument("--pr_emission_hidden", type=int, default=64,
@@ -262,6 +275,9 @@ if __name__ == "__main__":
             encoder_reads_pr=args.encoder_reads_pr,
             emission_hidden=args.emission_hidden,
             pr_emission=args.pr_emission,
+            reservoir_k=args.reservoir_k, u_rnn_hidden=args.u_rnn_hidden,
+            reservoir_tau_range=tuple(args.reservoir_tau), z_forced=args.z_forced,
+            cond_baseline=args.cond_baseline, baseline_rank=args.baseline_rank,
             pr_emission_hidden=args.pr_emission_hidden,
             pr_weight=args.pr_weight, pr_detach_z=args.pr_detach_z,
             dit_residual=args.dit_residual,

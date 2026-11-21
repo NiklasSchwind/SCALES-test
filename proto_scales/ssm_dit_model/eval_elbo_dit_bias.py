@@ -67,7 +67,7 @@ import pandas as pd
 import torch
 
 from proto_scales.ssm_dit_model.annual_elbo_dit import load_elbo_dit_annual
-from proto_scales.ssm_dit_model.annual_ssm import broadcast_to_monthly, to_annual
+from proto_scales.ssm_dit_model.annual_ssm import to_annual
 from proto_scales.ssm_dit_model.eval_jepa_rollout import MODEL_PATHS, load_trajectories
 
 MONTHS = 12
@@ -78,23 +78,6 @@ UNITS = {"tas": "K", "pr": "pr units"}
 # ─────────────────────────────────────────────────────────────────────────────
 # latents
 # ─────────────────────────────────────────────────────────────────────────────
-@torch.no_grad()
-def latent_trajectory(ssm, y_hist, u_hist, u_fut, n_ctx):
-    """
-    z for the DiT, [B, n_ctx + n_fut, z] monthly, built like
-    `ForcedAnnualLatentEncoder.forward`: posterior over `y_hist` (its last
-    `n_ctx` months form the context half), then the mean rollout over u_fut.
-    `y_hist` may be longer than n_ctx (full-history read). Also returns the
-    annual rollout [B, Y_fut, z].
-    """
-    z_hist_ann, z_last = ssm.posterior(*ssm.encoder_inputs(y_hist, u_hist))
-    z_fut_ann = ssm.roll_forward(z_last, to_annual(u_fut))
-    n_ctx_yr = n_ctx // MONTHS
-    z_ctx = broadcast_to_monthly(z_hist_ann[:, -n_ctx_yr:], n_ctx)
-    z_fut = broadcast_to_monthly(z_fut_ann, u_fut.shape[1])
-    return torch.cat([z_ctx, z_fut], dim=1), z_fut_ann
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,27 +224,27 @@ def main():
             def rep(x):
                 return x[None].expand(B, *x.shape).contiguous()
 
-            tas_ctx, pr_ctx, u_ctx = rep(tas[m0:m1]), rep(pr[m0:m1]), rep(u[m0:m1])
             tas_fut, pr_fut, u_fut = rep(tas[m1:]), rep(pr[m1:]), rep(u[m1:])
-            u_fut_ann = to_annual(u_fut[:1])
 
-            variants = {"ctx": (rep(field[me:m1]), rep(u[me:m1]))}
+            # History start per variant: what the forecast reads (the last
+            # enc_context_len months) and everything since the trajectory
+            # start. The model reads all history it is given (encoder and
+            # forcing pathway alike).
+            variants = {"ctx": me}
             if not args.no_full_history and me > 0:
-                variants["full"] = (rep(field[:m1]), rep(u[:m1]))
+                variants["full"] = 0
 
             years = S + np.arange(Y - s)
             esm = {v: to_phys(esm_ann_all[v][s:], scalers[v]) for v in VARS}  # [Y, R]
             curves = {v: {} for v in VARS}                                     # name -> [Y, R]
-            for vk, (y_hist, u_hist) in variants.items():
+            for vk, h0 in variants.items():
                 sfx = "" if vk == "ctx" else "(full)"
-                z_all, z_fut_ann = latent_trajectory(ssm, y_hist, u_hist, u_fut, n_ctx)
-                with torch.no_grad():
-                    z1 = z_fut_ann[:1]
-                    curves["tas"][f"SSM emit{sfx}"] = to_phys(
-                        ssm.emit_mean(z1, u_fut_ann)[0].cpu().numpy(), tas_sc)
-                    if has_pr_head:
-                        curves["pr"][f"SSM emit{sfx}"] = to_phys(
-                            ssm.emit_mean_pr(z1, u_fut_ann)[0].cpu().numpy(), pr_sc)
+                tas_h, pr_h, u_h = rep(tas[h0:m1]), rep(pr[h0:m1]), rep(u[h0:m1])
+                tas_m, pr_m = model.ssm_mean(tas_h[:1], pr_h[:1], u_h[:1], u_fut[:1],
+                                             enc_months="all")
+                curves["tas"][f"SSM emit{sfx}"] = to_phys(tas_m[0].cpu().numpy(), tas_sc)
+                if pr_m is not None:
+                    curves["pr"][f"SSM emit{sfx}"] = to_phys(pr_m[0].cpu().numpy(), pr_sc)
 
                 modes = [("free", False)] + ([("tf", True)] if vk == "ctx" else [])
                 if args.ssm_only:
@@ -271,8 +254,8 @@ def main():
                     print(f"[sample] {tag} z={vk} {mk}: {B} samples x "
                           f"{model.n_blocks(u_fut.shape[1])} blocks")
                     tas_g, pr_g = model.sample_blocks(
-                        tas_ctx, pr_ctx, u_ctx, u_fut, start_month=0,
-                        n_steps=args.n_steps, generator=gen, z_all=z_all,
+                        tas_h, pr_h, u_h, u_fut, start_month=0,
+                        n_steps=args.n_steps, generator=gen, enc_months="all",
                         tas_fut_true=tas_fut if tf else None,
                         pr_fut_true=pr_fut if tf else None)
                     for v, g in (("tas", tas_g), ("pr", pr_g)):

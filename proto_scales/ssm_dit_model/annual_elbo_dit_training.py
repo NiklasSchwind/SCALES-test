@@ -68,6 +68,12 @@ def run_train(
     emission_hidden=0,
     pr_emission=False,
     pr_emission_hidden=64,
+    reservoir_k=0,
+    u_rnn_hidden=32,
+    reservoir_tau_range=(2.0, 1000.0),
+    z_forced=True,
+    cond_baseline=False,
+    baseline_rank=32,
     pr_weight=1.0,
     pr_detach_z=True,
     dit_residual=False,
@@ -198,6 +204,8 @@ def run_train(
         monthly_encoder=monthly_encoder, enc_window_years=enc_window_years,
         encoder_reads_pr=encoder_reads_pr, emission_hidden=emission_hidden,
         pr_emission=pr_emission, pr_emission_hidden=pr_emission_hidden,
+        reservoir_k=reservoir_k, u_rnn_hidden=u_rnn_hidden,
+        reservoir_tau_range=tuple(reservoir_tau_range), z_forced=z_forced,
     )
     # Frozen pattern scaling, fitted on the training split only.
     W_ps, b_ps, r2_ps = fit_pattern_scaling(tas_n[tr], u_n[tr], ridge=pattern_ridge)
@@ -245,6 +253,7 @@ def run_train(
         dit_residual=dit_residual, pr_weight=pr_weight, pr_detach_z=pr_detach_z,
         enc_context_len=enc_context_len, rollout_obs_var=rollout_obs_var,
         ssm_only=ssm_only, ctx_offset_std=ctx_offset_std,
+        cond_baseline=cond_baseline, baseline_rank=baseline_rank,
     ).to(device)
 
     n_blocks = raw_model.n_blocks(horizon)
@@ -278,6 +287,15 @@ def run_train(
                   f"{'linear' if not pr_emission_hidden else f'MLP({pr_emission_hidden})'} "
                   f"residual(z), Gaussian NLL + rollout MSE, weight {pr_weight}, "
                   f"z {'detached' if pr_detach_z else 'trained by pr too'}")
+        if reservoir_k > 0:
+            print(f"[model] forcing pathway: u-GRU({u_rnn_hidden}) on annual u + "
+                  f"{reservoir_k} reservoirs per region, tau {tuple(reservoir_tau_range)} yr; "
+                  f"read by both emissions")
+        print(f"[model] transition: decay * z"
+              f"{' + B u' if z_forced else ' (no B u: z is the unforced state)'}"
+              f"{f' + MLP(z, u) [{trans_hidden}]' if trans_hidden else ''}")
+        print(f"[model] DiT conditioning: "
+              f"{f'z + baseline (rank {baseline_rank}) + u + month + field memory' if cond_baseline else 'z + GSAT memory kernels + u + month + field memory'}")
         print(f"[model] DiT target: "
               f"{'residual field - SSM baseline (tas + pr)' if dit_residual else 'full field'}")
         if raw_model.use_ssm_aux:

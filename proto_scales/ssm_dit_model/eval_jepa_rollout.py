@@ -194,15 +194,24 @@ def has_emission(m):
     return is_elbo(m) or bool(getattr(m, "annual_emission", False))
 
 
-def emit_ann(m, z, u_ann):
+def emit_ann(m, z, u_ann, u_prev=None):
     """
     Annual emission [..., 2R] in normalised units. ELBO: pattern scaling(u) +
     residual(z), tas only, pr filled with NaN so the plots/units code is shared.
     """
     if is_elbo(m):
+        # Forcing pathway (reservoirs): run from the start of `u_prev` (the
+        # history the encoder read), keep the part aligned with z.
+        f = None
+        if getattr(m, "reservoir_k", 0) > 0:
+            u_full = u_ann if u_prev is None else torch.cat([u_prev, u_ann], dim=-2)
+            batched = u_full.dim() == 3
+            f = m.forcing_features(u_full if batched else u_full[None])
+            f = f[..., f.shape[-2] - u_ann.shape[-2]:, :]
+            f = f if batched else f[0]
         if getattr(m, "pr_emission", False):
-            return m.emit_mean_field(z, u_ann)
-        tas = m.emit_mean(z, u_ann)
+            return m.emit_mean_field(z, u_ann, f)
+        tas = m.emit_mean(z, u_ann, f)
         return torch.cat([tas, torch.full_like(tas, float("nan"))], dim=-1)
     return m.emit(z)
 
@@ -349,7 +358,7 @@ def long_rollout(jepa, y_m, u_m, ctx):
                u_ann=u_ann[0].numpy())
     if has_emission(jepa):
         # normalised units; converted to physical in main()
-        res["y_emit"] = emit_ann(jepa, z_roll, u_ann[:, ctx:])[0].numpy()
+        res["y_emit"] = emit_ann(jepa, z_roll, u_ann[:, ctx:], u_prev=u_ann[:, :ctx])[0].numpy()
         res["y_ann"] = to_annual(y)[0, ctx:ctx + z_roll.shape[1]].numpy()
     if jepa.gated_decay:
         res["tau_roll"] = jepa.gated_efolding_years(z_last, u_ann[:, ctx:])[0].numpy()
@@ -582,7 +591,12 @@ def main():
         fit_on_training_set(jepa, args.run_dir, cfg, args.cluster)
 
     efold = jepa.efolding_years().numpy()
-    bnorm = jepa.B.weight.detach().norm(dim=1).numpy()
+    B_lin = getattr(jepa, "B", None)
+    if B_lin is None:
+        print("[model] transition has no B u (unforced z): ||B_row|| and gain are 0")
+        bnorm = np.zeros(jepa.z_dim, dtype=np.float32)
+    else:
+        bnorm = B_lin.weight.detach().norm(dim=1).numpy()
     # long-run response of each dim to constant forcing, ||B_row|| / (1 - d)
     # with the baseline decay (gate off)
     with torch.no_grad():
@@ -698,7 +712,8 @@ def main():
                             u_ann_full = to_annual(u_m[None])[0]
                             e_rolls = {r: phys(emit_ann(
                                 jepa, torch.tensor(rolls[r]),
-                                u_ann_full[r:r + rolls[r].shape[0]]).numpy())
+                                u_ann_full[r:r + rolls[r].shape[0]],
+                                u_prev=u_ann_full[:r]).numpy())
                                        for r in rs}
                         y_ann_full = phys(to_annual(y_m[None])[0].numpy())
                         plot_restarts_emission(e_rolls, y_ann_full, rs, regions, sel,
